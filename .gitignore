@@ -1,0 +1,11 @@
+obj/
+lib/
+bin/
+alire/
+config/
+db-engine.log
+tests/obj/
+tests/bin/
+tests/alire/
+tests/config/
+.idea

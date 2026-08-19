@@ -1,0 +1,17 @@
+name = "frostlake_tests"
+description = "Test suite for the Frostlake Ada driver"
+version = "0.1.0"
+
+authors = ["Michal Lorek"]
+maintainers = ["Michal Lorek <michal.lorek@gmail.com>"]
+maintainers-logins = ["mlorek"]
+licenses = "Apache-2.0"
+
+executables = ["frostlake_tests"]
+project-files = ["frostlake_tests.gpr"]
+
+[[depends-on]]
+frostlake = "*"
+
+[[pins]]
+frostlake = { path = ".." }
