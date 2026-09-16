@@ -170,6 +170,47 @@ package body Integration_Tests is
                    "FLOAT cell value");
          end Test_Exact_Numbers;
 
+         --  A text column declares its width in characters and a binary one
+         --  in bytes; an unbounded column declares the type's maximum.  No
+         --  other type declares one.
+         procedure Test_Column_Lengths is
+         begin
+            Conn.Execute
+              ("CREATE OR REPLACE TABLE T_WIDTHS "
+               & "(S VARCHAR(9), B BINARY(5), BIG VARCHAR, N NUMBER(10,2))");
+            declare
+               R : constant Result := Conn.Execute
+                 ("SELECT S, B, BIG, N FROM T_WIDTHS");
+            begin
+               if R.Columns.Element (1).Has_Length then
+                  Check (R.Columns.Element (1).Has_Length,
+                         "VARCHAR(9) has a length");
+                  Check_Equal
+                    (Long_Long_Integer (R.Columns.Element (1).Length), 9,
+                     "VARCHAR(9) length");
+                  Check (R.Columns.Element (2).Has_Length,
+                         "BINARY(5) has a length");
+                  Check_Equal
+                    (Long_Long_Integer (R.Columns.Element (2).Length), 5,
+                     "BINARY(5) length");
+                  Check (R.Columns.Element (3).Has_Length,
+                         "unbounded VARCHAR has a length");
+                  Check_Equal
+                    (Long_Long_Integer (R.Columns.Element (3).Length),
+                     16777216, "unbounded VARCHAR length");
+               else
+                  --  Engines before 0.1.0 send no length at all, and this
+                  --  driver supports them: a column then reports none, and
+                  --  there is no declared width to check.
+                  Skip ("the declared width of a text or binary column",
+                        "this engine sends no column length");
+               end if;
+               --  A number carries no width whichever engine answered.
+               Check (not R.Columns.Element (4).Has_Length,
+                      "NUMBER carries no length");
+            end;
+         end Test_Column_Lengths;
+
          procedure Test_Dml_Counts is
          begin
             Conn.Execute
@@ -223,9 +264,13 @@ package body Integration_Tests is
          end Test_Errors;
 
          procedure Test_Multi_Statement is
-            All_Sets : constant Result_Vectors.Vector :=
-              Conn.Execute_All ("SELECT 1 AS A; SELECT 2 AS B");
+            All_Sets : Result_Vectors.Vector;
          begin
+            --  A request carrying more than one statement has to be asked for;
+            --  0 means any number.  The count is restored afterwards because
+            --  every test here shares one session.
+            Conn.Execute ("ALTER SESSION SET MULTI_STATEMENT_COUNT = 0");
+            All_Sets := Conn.Execute_All ("SELECT 1 AS A; SELECT 2 AS B");
             Check_Equal
               (Long_Long_Integer (Natural (All_Sets.Length)), 2,
                "two result sets");
@@ -235,7 +280,62 @@ package body Integration_Tests is
             Check_Equal
               (As_Integer (Value (All_Sets.Element (2), 1, "B")), 2,
                "second result set");
+            Conn.Execute ("ALTER SESSION SET MULTI_STATEMENT_COUNT = 1");
          end Test_Multi_Statement;
+
+         procedure Test_Per_Call_Count is
+            All_Sets : Result_Vectors.Vector;
+            Counts_Statements : Boolean := True;
+         begin
+            --  No ALTER SESSION anywhere: the count rides on the call that
+            --  needs it, and the session still counts one statement after.
+            All_Sets := Conn.Execute_All ("SELECT 1 AS A; SELECT 2 AS B",
+                                          Multi_Statement_Count => 2);
+            Check_Equal
+              (Long_Long_Integer (Natural (All_Sets.Length)), 2,
+               "a pack the call declared itself");
+            Check_Equal
+              (As_Integer (Value (All_Sets.Element (2), 1, "B")), 2,
+               "its second result set");
+            --  0 means any number.
+            All_Sets := Conn.Execute_All ("SELECT 1; SELECT 2; SELECT 3",
+                                          Multi_Statement_Count => 0);
+            Check_Equal
+              (Long_Long_Integer (Natural (All_Sets.Length)), 3,
+               "any number of statements");
+            --  A count the call does not hold is refused, either way round.
+            --
+            --  Only an engine that counts the statements in a request refuses
+            --  one at all, and this driver supports older ones than that.
+            --  Against one of those neither refusal comes, so the two checks
+            --  below are skipped rather than passed: a green tick would claim
+            --  an engine had been checked for a refusal it does not make.
+            begin
+               Conn.Execute ("SELECT 1", Multi_Statement_Count => 2);
+               Counts_Statements := False;
+               Skip ("a count the call does not hold is refused",
+                     "this engine does not enforce a statement count");
+            exception
+               when Query_Error =>
+                  Check (True, "a count the call does not hold is refused");
+            end;
+            --  The session's own count is untouched by all of that, so a
+            --  pack that declares nothing still fails.
+            if Counts_Statements then
+               begin
+                  All_Sets :=
+                    Conn.Execute_All ("SELECT 1 AS A; SELECT 2 AS B");
+                  Record_Failure
+                    ("the session's count was changed underneath");
+               exception
+                  when Query_Error =>
+                     Check (True, "the session's count is untouched");
+               end;
+            else
+               Skip ("the session's count is untouched by a per-call count",
+                     "this engine does not enforce a statement count");
+            end if;
+         end Test_Per_Call_Count;
 
          procedure Test_Transactions is
 
@@ -329,9 +429,11 @@ package body Integration_Tests is
          Guarded ("session defaults", Test_Session_Defaults'Access);
          Guarded ("types round trip", Test_Types_Round_Trip'Access);
          Guarded ("exact numbers", Test_Exact_Numbers'Access);
+         Guarded ("column lengths", Test_Column_Lengths'Access);
          Guarded ("dml counts", Test_Dml_Counts'Access);
          Guarded ("errors", Test_Errors'Access);
          Guarded ("multi statement", Test_Multi_Statement'Access);
+         Guarded ("per call count", Test_Per_Call_Count'Access);
          Guarded ("transactions", Test_Transactions'Access);
          Guarded ("transaction helper", Test_Transaction_Helper'Access);
          Guarded ("time cell", Test_Time_Cell'Access);

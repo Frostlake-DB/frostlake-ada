@@ -836,8 +836,10 @@ package body Frostlake is
 
    --  One statement over the wire; the caller holds the lock.
    function Round_Trip
-     (Conn     : in out Connection;
-      Rendered : String) return Wire.Response
+     (Conn                  : in out Connection;
+      Rendered              : String;
+      Multi_Statement_Count : Integer := No_Multi_Statement_Count)
+      return Wire.Response
    is
       Reply : constant Http.Reply :=
         Http.Post
@@ -845,9 +847,12 @@ package body Frostlake is
            Port         => Conn.Port,
            Path         => "/api/execute",
            Content      => Wire.Build_Execute_Request
-                             (Sql         => Rendered,
-                              Session_Id  => To_String (Conn.Session_Id),
-                              Auto_Commit => Conn.Auto_Commit),
+                             (Sql                   => Rendered,
+                              Session_Id            =>
+                                To_String (Conn.Session_Id),
+                              Auto_Commit           => Conn.Auto_Commit,
+                              Multi_Statement_Count =>
+                                Multi_Statement_Count),
            Open_Timeout => Conn.Open_Timeout,
            Read_Timeout => Conn.Read_Timeout);
       Parsed : Wire.Response;
@@ -955,14 +960,19 @@ package body Frostlake is
    --  the session as one unit: another task must not slip a query in
    --  between.  The caller holds the lock.
    function Locked_Execute_All
-     (Conn     : in out Connection;
-      Original : String;
-      Rendered : String) return Result_Vectors.Vector is
+     (Conn                  : in out Connection;
+      Original              : String;
+      Rendered              : String;
+      Multi_Statement_Count : Integer := No_Multi_Statement_Count)
+      return Result_Vectors.Vector is
    begin
       Restore_Session_Defaults (Conn);
+      --  Each pending USE is one statement of its own, whatever this call
+      --  declares.
       Drain_Pending (Conn);
       declare
-         Parsed : constant Wire.Response := Round_Trip (Conn, Rendered);
+         Parsed : constant Wire.Response :=
+           Round_Trip (Conn, Rendered, Multi_Statement_Count);
          Out_V  : constant Result_Vectors.Vector :=
            Shaped (Parsed.Result_Sets);
       begin
@@ -1048,19 +1058,27 @@ package body Frostlake is
    end Ping;
 
    function Execute_All
-     (Conn  : in out Connection;
-      Sql   : String;
-      Binds : Bind_Array := No_Binds) return Result_Vectors.Vector
+     (Conn                  : in out Connection;
+      Sql                   : String;
+      Binds                 : Bind_Array := No_Binds;
+      Multi_Statement_Count : Integer := No_Multi_Statement_Count)
+      return Result_Vectors.Vector
    is
       Rendered : constant String :=
         (if Binds'Length = 0 then Sql else Sql_Text.Substitute (Sql, Binds));
    begin
       Check_Open (Conn);
+      if Multi_Statement_Count < No_Multi_Statement_Count then
+         raise Usage_Error with
+           "multi_statement_count must be 0 or more, got "
+           & Trimmed (Integer'Image (Multi_Statement_Count));
+      end if;
       Conn.Lock.Seize;
       begin
          declare
             Out_V : constant Result_Vectors.Vector :=
-              Locked_Execute_All (Conn, Sql, Rendered);
+              Locked_Execute_All (Conn, Sql, Rendered,
+                                  Multi_Statement_Count);
          begin
             Conn.Lock.Release;
             return Out_V;
@@ -1073,23 +1091,26 @@ package body Frostlake is
    end Execute_All;
 
    function Execute
-     (Conn  : in out Connection;
-      Sql   : String;
-      Binds : Bind_Array := No_Binds) return Result
+     (Conn                  : in out Connection;
+      Sql                   : String;
+      Binds                 : Bind_Array := No_Binds;
+      Multi_Statement_Count : Integer := No_Multi_Statement_Count)
+      return Result
    is
       All_Sets : constant Result_Vectors.Vector :=
-        Execute_All (Conn, Sql, Binds);
+        Execute_All (Conn, Sql, Binds, Multi_Statement_Count);
    begin
       return All_Sets.First_Element;
    end Execute;
 
    procedure Execute
-     (Conn  : in out Connection;
-      Sql   : String;
-      Binds : Bind_Array := No_Binds)
+     (Conn                  : in out Connection;
+      Sql                   : String;
+      Binds                 : Bind_Array := No_Binds;
+      Multi_Statement_Count : Integer := No_Multi_Statement_Count)
    is
       Ignored : constant Result_Vectors.Vector :=
-        Execute_All (Conn, Sql, Binds);
+        Execute_All (Conn, Sql, Binds, Multi_Statement_Count);
       pragma Unreferenced (Ignored);
    begin
       null;
