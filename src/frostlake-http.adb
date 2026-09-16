@@ -1,3 +1,5 @@
+pragma Ada_2022;
+
 with Ada.Exceptions;
 with Ada.Streams;
 

@@ -1,3 +1,5 @@
+pragma Ada_2022;
+
 with Ada.Characters.Handling;
 
 package body Frostlake.Wire is
@@ -21,6 +23,14 @@ package body Frostlake.Wire is
 
    function Is_Digit (C : Character) return Boolean is
      (C in '0' .. '9');
+
+   function Trimmed (Image : String) return String is
+   begin
+      if Image'Length > 0 and then Image (Image'First) = ' ' then
+         return Image (Image'First + 1 .. Image'Last);
+      end if;
+      return Image;
+   end Trimmed;
 
    ------------------------
    --  Numeric text      --
@@ -152,9 +162,11 @@ package body Frostlake.Wire is
    -----------------------------
 
    function Build_Execute_Request
-     (Sql         : String;
-      Session_Id  : String;
-      Auto_Commit : Boolean) return String
+     (Sql                   : String;
+      Session_Id            : String;
+      Auto_Commit           : Boolean;
+      Multi_Statement_Count : Integer := No_Multi_Statement_Count)
+      return String
    is
       Out_Text : Unbounded_String;
    begin
@@ -166,6 +178,10 @@ package body Frostlake.Wire is
          Append (Out_Text, ",""sessionId"":""");
          Append (Out_Text, Escape_Json (Session_Id));
          Append (Out_Text, """");
+      end if;
+      if Multi_Statement_Count /= No_Multi_Statement_Count then
+         Append (Out_Text, ",""multiStatementCount"":");
+         Append (Out_Text, Trimmed (Integer'Image (Multi_Statement_Count)));
       end if;
       Append (Out_Text, "}");
       return To_String (Out_Text);
@@ -958,6 +974,19 @@ package body Frostlake.Wire is
                                             (Natural'Last)
                      then
                         Col.Scale := Natural (V);
+                     end if;
+                  end;
+               elsif Key = "length" and then Peek /= 'n' then
+                  declare
+                     V  : Long_Long_Integer;
+                     Ok : Boolean;
+                  begin
+                     To_Integer_If_Integral (Parse_Number_Text, V, Ok);
+                     if Ok and then V in 0 .. Long_Long_Integer
+                                            (Natural'Last)
+                     then
+                        Col.Length := Natural (V);
+                        Col.Has_Length := True;
                      end if;
                   end;
                elsif Key = "nullable" then

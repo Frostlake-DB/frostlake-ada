@@ -4,6 +4,7 @@ package body Test_Support is
 
    Pass_Count : Natural := 0;
    Fail_Count : Natural := 0;
+   Skip_Count : Natural := 0;
 
    procedure Note (Message : String) is
    begin
@@ -58,6 +59,13 @@ package body Test_Support is
       Ada.Text_IO.Flush;
    end Record_Failure;
 
+   procedure Skip (Label : String; Why : String) is
+   begin
+      Skip_Count := Skip_Count + 1;
+      Ada.Text_IO.Put_Line ("SKIP: " & Label & " — " & Why);
+      Ada.Text_IO.Flush;
+   end Skip;
+
    function Passed return Natural is
    begin
       return Pass_Count;
@@ -67,5 +75,10 @@ package body Test_Support is
    begin
       return Fail_Count;
    end Failed;
+
+   function Skipped return Natural is
+   begin
+      return Skip_Count;
+   end Skipped;
 
 end Test_Support;

@@ -1,3 +1,5 @@
+pragma Ada_2022;
+
 with Ada.Strings.Unbounded;
 
 package body Frostlake.Sql is

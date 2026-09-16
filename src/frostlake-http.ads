@@ -1,3 +1,5 @@
+pragma Ada_2022;
+
 --  A minimal HTTP/1.1 client over GNAT.Sockets — just enough for the
 --  engine's API.  Every request opens its own connection and sends
 --  Connection: close, which against DatabaseHttpServer is measurably

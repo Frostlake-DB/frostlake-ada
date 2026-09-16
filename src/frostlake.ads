@@ -1,3 +1,5 @@
+pragma Ada_2022;
+
 --  An Ada driver for Frostlake, speaking the engine's HTTP protocol against
 --  a running DatabaseHttpServer.
 --
@@ -59,6 +61,10 @@ package Frostlake is
    --  "Not given" for Connect's optional arguments: an explicit argument
    --  outranks the DSN, which outranks the default.
    Unset : constant Duration := -1.0;
+
+   --  "Not given" for Execute's Multi_Statement_Count: no count travels
+   --  with the request and the session's MULTI_STATEMENT_COUNT decides.
+   No_Multi_Statement_Count : constant Integer := -1;
 
    ---------------------------------------------------------------------
    --  Dates and timestamps.  Deliberately plain records rather than
@@ -192,6 +198,14 @@ package Frostlake is
       Data_Type : Ada.Strings.Unbounded.Unbounded_String;
       Precision : Natural := 0;
       Scale     : Natural := 0;
+      --  The declared width of a text (characters) or binary (bytes)
+      --  column -- the type's maximum when the column is unbounded.  The
+      --  account reports this one number as both the column's precision
+      --  and its display size.  Has_Length is False for every other type,
+      --  and for a server that predates the field: the width is unknown,
+      --  not zero.
+      Has_Length : Boolean := False;
+      Length     : Natural := 0;
       --  Whether the column is KNOWN to accept NULL; Unknown means the
       --  server predates the field.
       Can_Be_Null : Nullability := Unknown;
@@ -254,22 +268,35 @@ package Frostlake is
    --  Raises Connection_Error unless GET /api/health answers 2xx.
 
    function Execute
-     (Conn  : in out Connection;
-      Sql   : String;
-      Binds : Bind_Array := No_Binds) return Result;
+     (Conn                  : in out Connection;
+      Sql                   : String;
+      Binds                 : Bind_Array := No_Binds;
+      Multi_Statement_Count : Integer := No_Multi_Statement_Count)
+      return Result;
    --  Executes one statement.  A multi-statement string answers with its
    --  first result set — use Execute_All for the rest.
 
    function Execute_All
-     (Conn  : in out Connection;
-      Sql   : String;
-      Binds : Bind_Array := No_Binds) return Result_Vectors.Vector;
+     (Conn                  : in out Connection;
+      Sql                   : String;
+      Binds                 : Bind_Array := No_Binds;
+      Multi_Statement_Count : Integer := No_Multi_Statement_Count)
+      return Result_Vectors.Vector;
    --  Every result set the statement string produced, in order.
+   --
+   --  Multi_Statement_Count says how many statements this call carries, 0
+   --  for any number; the engine refuses a call whose count differs, as
+   --  the account does.  It travels with this one request and outranks the
+   --  session's MULTI_STATEMENT_COUNT for it without changing any session
+   --  state, so there is nothing to put back afterwards and another task
+   --  sharing the connection is unaffected.  Left at
+   --  No_Multi_Statement_Count nothing is sent and the session decides.
 
    procedure Execute
-     (Conn  : in out Connection;
-      Sql   : String;
-      Binds : Bind_Array := No_Binds);
+     (Conn                  : in out Connection;
+      Sql                   : String;
+      Binds                 : Bind_Array := No_Binds;
+      Multi_Statement_Count : Integer := No_Multi_Statement_Count);
    --  Execute, discarding the result — for DDL and fire-and-forget DML.
 
    procedure Begin_Transaction (Conn : in out Connection);

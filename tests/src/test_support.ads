@@ -20,7 +20,14 @@ package Test_Support is
    --  For hand-rolled patterns the two Checks do not cover — an expected
    --  exception that did not arrive, an unexpected one that did.
 
+   procedure Skip (Label : String; Why : String);
+   --  A check this engine cannot answer.  The driver supports engines older
+   --  than the behaviour some checks look for; counting one of those as a
+   --  pass would claim an engine had been checked for something it never
+   --  reports, so it is tallied apart and printed with its reason.
+
    function Passed return Natural;
    function Failed return Natural;
+   function Skipped return Natural;
 
 end Test_Support;

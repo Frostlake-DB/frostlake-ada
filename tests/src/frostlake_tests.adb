@@ -257,6 +257,24 @@ procedure Frostlake_Tests is
          "{""sql"":""SELECT 1"",""autoCommit"":false,"
          & """sessionId"":""abc""}",
          "request with a session");
+      --  A request that declares no count carries no field at all, so the
+      --  session's MULTI_STATEMENT_COUNT keeps deciding.
+      Check_Equal
+        (Wire.Build_Execute_Request
+           ("SELECT 1", "", True, No_Multi_Statement_Count),
+         "{""sql"":""SELECT 1"",""autoCommit"":true}",
+         "request without a count");
+      Check_Equal
+        (Wire.Build_Execute_Request ("SELECT 1; SELECT 2", "abc", True, 2),
+         "{""sql"":""SELECT 1; SELECT 2"",""autoCommit"":true,"
+         & """sessionId"":""abc"",""multiStatementCount"":2}",
+         "request with a count");
+      --  0 is a count like any other — any number — not an absent one.
+      Check_Equal
+        (Wire.Build_Execute_Request ("SELECT 1; SELECT 2", "", True, 0),
+         "{""sql"":""SELECT 1; SELECT 2"",""autoCommit"":true,"
+         & """multiStatementCount"":0}",
+         "request asking for any number");
    end Test_Build_Request;
 
    procedure Test_Parse_Success_Response is
@@ -299,6 +317,39 @@ procedure Frostlake_Tests is
          Check_Equal (Long_Long_Integer (Set.Row_Count), 2, "row count");
       end;
    end Test_Parse_Success_Response;
+
+   --  Only text and binary columns declare a width; anything else, and any
+   --  server that predates the field, leaves Has_Length False rather than
+   --  reporting a width of zero.
+   procedure Test_Parse_Column_Length is
+      Parsed : constant Wire.Response := Wire.Parse_Response
+        ("{""success"":true,""resultSets"":[{"
+         & """columns"":[{""name"":""S"",""dataType"":""VARCHAR"","
+         & """precision"":0,""scale"":0,""length"":9},"
+         & "{""name"":""B"",""dataType"":""BINARY"","
+         & """precision"":0,""scale"":0,""length"":5},"
+         & "{""name"":""BIG"",""dataType"":""VARCHAR"","
+         & """precision"":0,""scale"":0,""length"":16777216},"
+         & "{""name"":""N"",""dataType"":""NUMBER"","
+         & """precision"":10,""scale"":2}],"
+         & """rows"":[],""rowCount"":0}],""executionTimeMs"":1}");
+      Set : constant Result := Parsed.Result_Sets.Element (1);
+   begin
+      Check (Set.Columns.Element (1).Has_Length, "VARCHAR(9) has a length");
+      Check_Equal (Long_Long_Integer (Set.Columns.Element (1).Length), 9,
+                   "VARCHAR(9) length");
+      Check (Set.Columns.Element (2).Has_Length, "BINARY(5) has a length");
+      Check_Equal (Long_Long_Integer (Set.Columns.Element (2).Length), 5,
+                   "BINARY(5) length");
+      Check (Set.Columns.Element (3).Has_Length,
+             "unbounded VARCHAR has a length");
+      Check_Equal (Long_Long_Integer (Set.Columns.Element (3).Length),
+                   16777216, "unbounded VARCHAR length");
+      Check (not Set.Columns.Element (4).Has_Length,
+             "NUMBER carries no length");
+      Check_Equal (Long_Long_Integer (Set.Columns.Element (4).Length), 0,
+                   "an absent length leaves the default");
+   end Test_Parse_Column_Length;
 
    procedure Test_Parse_Shuffled_Response is
       Parsed : constant Wire.Response := Wire.Parse_Response
@@ -484,7 +535,8 @@ procedure Frostlake_Tests is
         ((Name      => Ada.Strings.Unbounded.To_Unbounded_String (Name),
           Data_Type =>
             Ada.Strings.Unbounded.To_Unbounded_String ("NUMBER"),
-          Precision => 38, Scale => 0, Can_Be_Null => Unknown));
+          Precision => 38, Scale => 0, Can_Be_Null => Unknown,
+          others    => <>));
    begin
       Check (not Wire.Is_Dml_Status (Cols), "no columns is not a status");
       Cols.Append (Named ("number of rows inserted"));
@@ -618,6 +670,47 @@ procedure Frostlake_Tests is
       end;
       Loopback.Stop;
    end Test_Loopback_Execute;
+
+   procedure Test_Loopback_Multi_Statement_Count is
+      Port : Positive;
+   begin
+      Loopback.Start (Plain_Ok, Port);
+      declare
+         Conn : Connection := Connect ("frostlake://127.0.0.1:"
+                                       & Img (Port));
+         Ignored : Result_Vectors.Vector;
+      begin
+         Conn.Execute ("SELECT 1");
+         Ignored := Conn.Execute_All ("SELECT 1; SELECT 2",
+                                      Multi_Statement_Count => 2);
+         Conn.Execute ("SELECT 1");
+         Check (not Contains (Loopback.Request_Text (2),
+                              "multiStatementCount"),
+                "no count unless the call asks for one");
+         Check (Contains (Loopback.Request_Text (3),
+                          """multiStatementCount"":2"),
+                "the declared count rides on that request");
+         Check (not Contains (Loopback.Request_Text (4),
+                              "multiStatementCount"),
+                "and on no other");
+         --  Nothing alters session state to carry it.
+         for I in 2 .. Loopback.Request_Count loop
+            Check (not Contains (Loopback.Request_Text (I), "ALTER SESSION"),
+                   "no session change behind the caller's back");
+         end loop;
+         --  Only No_Multi_Statement_Count stands for "not given"; any other
+         --  negative is a mistake, refused before anything is sent.
+         begin
+            Conn.Execute ("SELECT 1", Multi_Statement_Count => -2);
+            Record_Failure ("a count below zero was accepted");
+         exception
+            when Usage_Error =>
+               null;
+         end;
+         Conn.Close;
+      end;
+      Loopback.Stop;
+   end Test_Loopback_Multi_Statement_Count;
 
    procedure Test_Loopback_Dml_Shaping is
       Port : Positive;
@@ -831,6 +924,7 @@ begin
    Guarded ("escape json", Test_Escape_Json'Access);
    Guarded ("build request", Test_Build_Request'Access);
    Guarded ("parse success", Test_Parse_Success_Response'Access);
+   Guarded ("parse column length", Test_Parse_Column_Length'Access);
    Guarded ("parse shuffled", Test_Parse_Shuffled_Response'Access);
    Guarded ("parse error", Test_Parse_Error_Response'Access);
    Guarded ("parse garbage", Test_Parse_Garbage'Access);
@@ -841,6 +935,8 @@ begin
    Guarded ("dsn errors", Test_Dsn_Errors'Access);
    Guarded ("connect flow", Test_Connect_Flow'Access);
    Guarded ("loopback execute", Test_Loopback_Execute'Access);
+   Guarded ("loopback multi statement count",
+            Test_Loopback_Multi_Statement_Count'Access);
    Guarded ("loopback dml shaping", Test_Loopback_Dml_Shaping'Access);
    Guarded ("loopback query error", Test_Loopback_Query_Error'Access);
    Guarded ("loopback unreadable", Test_Loopback_Unreadable'Access);
@@ -850,7 +946,8 @@ begin
 
    Run_Integration;
 
-   Note (Img (Passed) & " passed," & Natural'Image (Failed) & " failed");
+   Note (Img (Passed) & " passed," & Natural'Image (Failed) & " failed,"
+         & Natural'Image (Skipped) & " skipped");
    if Failed > 0 then
       Ada.Command_Line.Set_Exit_Status (1);
    end if;

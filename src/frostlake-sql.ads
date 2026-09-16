@@ -1,3 +1,5 @@
+pragma Ada_2022;
+
 --  Client-side SQL assembly: identifier quoting, literal rendering, and
 --  ?-placeholder substitution.  Public so the test suite (and a caller
 --  building SQL by hand) can reach it; the shapes here mirror Frostlake's

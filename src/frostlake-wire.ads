@@ -1,3 +1,5 @@
+pragma Ada_2022;
+
 --  The JSON wire protocol of POST /api/execute: building the request body
 --  and reading the response.  Public so the test suite can exercise it
 --  without a server; not otherwise part of the driver's stable API.
@@ -19,10 +21,15 @@ package Frostlake.Wire is
    end record;
 
    function Build_Execute_Request
-     (Sql         : String;
-      Session_Id  : String;
-      Auto_Commit : Boolean) return String;
-   --  {"sql":...,"autoCommit":...} plus "sessionId" when one is held.
+     (Sql                   : String;
+      Session_Id            : String;
+      Auto_Commit           : Boolean;
+      Multi_Statement_Count : Integer := No_Multi_Statement_Count)
+      return String;
+   --  {"sql":...,"autoCommit":...} plus "sessionId" when one is held and
+   --  "multiStatementCount" when this request declares one.  Left at
+   --  No_Multi_Statement_Count the field is absent altogether, which is
+   --  the body the server has always been sent.
 
    function Parse_Response (Content : String) return Response;
    --  Reads the whole response object.  Cells are typed from their
