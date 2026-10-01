@@ -1,6 +1,6 @@
 name = "frostlake"
 description = "Ada driver for Frostlake, speaking the engine's HTTP protocol"
-version = "0.1.0"
+version = "0.2.0"
 
 long-description = """
 A dependency-free Ada 2022 client for Frostlake's DatabaseHttpServer:

@@ -25,7 +25,7 @@ with Ada.Strings.Unbounded;
 
 package Frostlake is
 
-   Version : constant String := "0.1.0";
+   Version : constant String := "0.2.0";
 
    ---------------------------------------------------------------------
    --  Errors.  Ada has no exception hierarchy, so the kinds every
