@@ -33,4 +33,13 @@ package Frostlake.Http is
       Open_Timeout : Duration;
       Read_Timeout : Duration) return Reply;
 
+   function Delete
+     (Host         : String;
+      Port         : Positive;
+      Path         : String;
+      Open_Timeout : Duration;
+      Read_Timeout : Duration) return Reply;
+   --  DELETE Path.  Used to release a session; a server that has no such
+   --  route answers 404 or 405, which is the caller's to read.
+
 end Frostlake.Http;

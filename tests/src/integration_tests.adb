@@ -1,7 +1,10 @@
 with Ada.Exceptions;
 with Ada.Strings.Fixed;
+with Ada.Strings.Unbounded;
 
 with Frostlake;
+with Frostlake.Http;
+with Frostlake.Wire;
 with Test_Support;
 
 package body Integration_Tests is
@@ -27,6 +30,96 @@ package body Integration_Tests is
             & Ada.Exceptions.Exception_Information (E));
    end Guarded;
 
+   --  How many sessions the server is holding, read straight off
+   --  `GET /api/sessions`, whose body carries an activeSessions count. The driver offers no
+   --  way to see this, and it is the only observable that tells a released
+   --  session from one left for the reaper.
+   function Active_Sessions (Dsn_Base : String) return Integer is
+      Rest  : constant String :=
+        Dsn_Base (Dsn_Base'First + 12 .. Dsn_Base'Last);  --  past the scheme
+      Colon : constant Natural := Ada.Strings.Fixed.Index (Rest, ":");
+      Reply : constant Frostlake.Http.Reply :=
+        Frostlake.Http.Get
+          (Host         => Rest (Rest'First .. Colon - 1),
+           Port         => Integer'Value (Rest (Colon + 1 .. Rest'Last)),
+           Path         => "/api/sessions",
+           Open_Timeout => 5.0,
+           Read_Timeout => 5.0);
+      Text  : constant String :=
+        Ada.Strings.Unbounded.To_String (Reply.Content);
+      Mark  : constant Natural :=
+        Ada.Strings.Fixed.Index (Text, """activeSessions"":");
+      First : Natural;
+      Last  : Natural;
+   begin
+      if Mark = 0 then
+         return -1;
+      end if;
+      First := Mark + 17;
+      Last := First;
+      while Last <= Text'Last and then Text (Last) in '0' .. '9' loop
+         Last := Last + 1;
+      end loop;
+      return Integer'Value (Text (First .. Last - 1));
+   end Active_Sessions;
+
+   --  The host and port Dsn_Base ("frostlake://host:port") names.
+   function Host_Of (Dsn_Base : String) return String is
+      Rest  : constant String :=
+        Dsn_Base (Dsn_Base'First + 12 .. Dsn_Base'Last);  --  past the scheme
+      Colon : constant Natural := Ada.Strings.Fixed.Index (Rest, ":");
+   begin
+      return Rest (Rest'First .. Colon - 1);
+   end Host_Of;
+
+   function Port_Of (Dsn_Base : String) return Positive is
+      Rest  : constant String :=
+        Dsn_Base (Dsn_Base'First + 12 .. Dsn_Base'Last);
+      Colon : constant Natural := Ada.Strings.Fixed.Index (Rest, ":");
+   begin
+      return Integer'Value (Rest (Colon + 1 .. Rest'Last));
+   end Port_Of;
+
+   --  DELETE /api/sessions/{Id}, sent past the driver — the way the engine's
+   --  idle expiry or a restart ends a session behind a connection's back.
+   procedure Release_Behind_Its_Back (Dsn_Base : String; Id : String) is
+      Reply : constant Frostlake.Http.Reply :=
+        Frostlake.Http.Delete
+          (Host         => Host_Of (Dsn_Base),
+           Port         => Port_Of (Dsn_Base),
+           Path         => "/api/sessions/" & Id,
+           Open_Timeout => 5.0,
+           Read_Timeout => 5.0);
+   begin
+      Check (Reply.Status = 200,
+             "the engine released session " & Id & ": HTTP"
+             & Natural'Image (Reply.Status));
+   end Release_Behind_Its_Back;
+
+   --  Whether the engine keeps sessions to their id — it answers
+   --  newSession, and so honours requireSession and DELETE
+   --  /api/sessions/{id} — asked past the driver.  Engines before 0.1.0 do
+   --  neither, and this driver supports them.
+   function Keeps_Sessions (Dsn_Base : String) return Boolean is
+      Reply  : constant Frostlake.Http.Reply :=
+        Frostlake.Http.Post
+          (Host         => Host_Of (Dsn_Base),
+           Port         => Port_Of (Dsn_Base),
+           Path         => "/api/execute",
+           Content      => "{""sql"":""SELECT 1""}",
+           Open_Timeout => 5.0,
+           Read_Timeout => 5.0);
+      Parsed : constant Frostlake.Wire.Response :=
+        Frostlake.Wire.Parse_Response
+          (Ada.Strings.Unbounded.To_String (Reply.Content));
+   begin
+      if Parsed.Has_New_Session and then Parsed.Has_Session_Id then
+         Release_Behind_Its_Back
+           (Dsn_Base, Ada.Strings.Unbounded.To_String (Parsed.Session_Id));
+      end if;
+      return Parsed.Has_New_Session;
+   end Keeps_Sessions;
+
    procedure Run (Dsn_Base : String) is
 
       procedure Create_Fixture is
@@ -41,6 +134,130 @@ package body Integration_Tests is
       Note ("integration: against " & Dsn_Base);
 
       Guarded ("create fixture", Create_Fixture'Access);
+
+      declare
+         --  Closing hands the session back rather than leaving it, and any
+         --  transaction it holds, to the reaper. A server that has no such
+         --  route answers 404 or 405 and closing still succeeds, so this
+         --  checks the count only when the server answered it at all.
+         procedure Test_Close_Releases_The_Session is
+            Before : constant Integer := Active_Sessions (Dsn_Base);
+            During : Integer;
+            After  : Integer;
+         begin
+            if Before < 0 then
+               Skip ("closing releases the server session",
+                     "this server does not report a session count");
+               return;
+            end if;
+            declare
+               Conn : Connection := Connect (Dsn_Base);
+            begin
+               Conn.Execute ("SELECT 1");
+               During := Active_Sessions (Dsn_Base);
+               Conn.Close;
+               After := Active_Sessions (Dsn_Base);
+               --  And closing twice is not an error, nor a second release.
+               Conn.Close;
+            end;
+            Check (During = Before + 1,
+                   "the statement opened one session, count now"
+                   & Integer'Image (During));
+            Check_Equal (Long_Long_Integer (After), Long_Long_Integer (Before),
+                         "closing gave the session back");
+            Check_Equal (Long_Long_Integer (Active_Sessions (Dsn_Base)),
+                         Long_Long_Integer (Before),
+                         "closing twice released nothing further");
+         end Test_Close_Releases_The_Session;
+      begin
+         Guarded ("close releases the session",
+                  Test_Close_Releases_The_Session'Access);
+      end;
+
+      declare
+         --  A session released behind the connection's back, as the
+         --  engine's idle expiry or a restart would: the next statement runs
+         --  in a fresh session on the DSN's scope.
+         procedure Test_Lost_Session_Recovers is
+         begin
+            if not Keeps_Sessions (Dsn_Base) then
+               Skip ("a lost session is replaced on the DSN's scope",
+                     "this engine answers no newSession");
+               return;
+            end if;
+            declare
+               Conn : Connection := Connect (Dsn_Base & "/ADA_DB?schema=S1");
+            begin
+               Conn.Execute ("SELECT 1");
+               declare
+                  Before : constant String := Conn.Session;
+               begin
+                  Release_Behind_Its_Back (Dsn_Base, Before);
+                  declare
+                     R : constant Result := Conn.Execute
+                       ("SELECT CURRENT_DATABASE() AS D,"
+                        & " CURRENT_SCHEMA() AS S");
+                  begin
+                     Check_Equal (As_String (Value (R, 1, "D")), "ADA_DB",
+                                  "a fresh session on the DSN's database");
+                     Check_Equal (As_String (Value (R, 1, "S")), "S1",
+                                  "and on its schema");
+                  end;
+                  Check (Conn.Session /= Before and then Conn.Session /= "",
+                         "a fresh session holds the connection");
+               end;
+               Conn.Close;
+            end;
+         end Test_Lost_Session_Recovers;
+
+         --  The same with a transaction open is refused: the transaction
+         --  went with the session, and the statement did not run.
+         procedure Test_Lost_Transaction_Raises is
+         begin
+            if not Keeps_Sessions (Dsn_Base) then
+               Skip ("a lost transaction raises",
+                     "this engine answers no newSession");
+               return;
+            end if;
+            declare
+               Conn : Connection := Connect (Dsn_Base & "/ADA_DB?schema=S1");
+            begin
+               Conn.Execute ("CREATE OR REPLACE TABLE LOST_TX (N INTEGER)");
+               Conn.Execute ("BEGIN");
+               Conn.Execute ("INSERT INTO LOST_TX VALUES (1)");
+               Release_Behind_Its_Back (Dsn_Base, Conn.Session);
+               begin
+                  Conn.Execute ("INSERT INTO LOST_TX VALUES (2)");
+                  Record_Failure ("a statement in a lost transaction ran");
+               exception
+                  when E : Session_Lost_Error =>
+                     Check (Contains (Ada.Exceptions.Exception_Message (E),
+                                      "transaction"),
+                            "the lost transaction named: "
+                            & Ada.Exceptions.Exception_Message (E));
+               end;
+               Check (not Conn.In_Transaction,
+                      "the transaction went with the session");
+               declare
+                  R : constant Result := Conn.Execute
+                    ("SELECT COUNT(*) AS N, CURRENT_DATABASE() AS D"
+                     & " FROM LOST_TX");
+               begin
+                  --  Releasing rolled the first INSERT back, and the
+                  --  second never ran.
+                  Check_Equal (As_Integer (Value (R, 1, "N")), 0,
+                               "nothing of the lost transaction remains");
+                  Check_Equal (As_String (Value (R, 1, "D")), "ADA_DB",
+                               "the next statement ran on the DSN's scope");
+               end;
+               Conn.Close;
+            end;
+         end Test_Lost_Transaction_Raises;
+      begin
+         Guarded ("lost session recovers", Test_Lost_Session_Recovers'Access);
+         Guarded ("lost transaction raises",
+                  Test_Lost_Transaction_Raises'Access);
+      end;
 
       declare
          Conn : Connection := Connect (Dsn_Base & "/ADA_DB?schema=S1");
@@ -122,10 +339,27 @@ package body Integration_Tests is
                   Got : constant Timestamp_Value :=
                     As_Timestamp (Value (R, 1, "AT_TZ"));
                begin
-                  Check (Got.Has_Offset, "AT_TZ carries an offset");
-                  Check (Got = Tz,
-                         "AT_TZ cell, got "
-                         & Image (Value (R, 1, "AT_TZ")));
+                  --  Older engines send a TIMESTAMP_TZ with no offset at all,
+                  --  keeping only the wall clock, and this driver then reads it
+                  --  at the machine's own offset. Current engines send the
+                  --  offset the value was written with, as live does. This
+                  --  driver supports both, and where the engine sent no offset
+                  --  there is nothing here to check, so the case is SKIPPED
+                  --  rather than passed: a green tick would claim an engine had
+                  --  been checked for something it never sent. The offset that
+                  --  did arrive is named, so a wrong one is not mistaken for an
+                  --  absent one.
+                  if not Got.Has_Offset
+                    or else Got.Offset_Minutes /= Tz.Offset_Minutes
+                  then
+                     Skip ("a TIMESTAMP_TZ keeps the offset it was written with",
+                           "this engine sends none, and the value read back as "
+                           & Image (Value (R, 1, "AT_TZ")));
+                  else
+                     Check (Got = Tz,
+                            "AT_TZ cell, got "
+                            & Image (Value (R, 1, "AT_TZ")));
+                  end if;
                end;
                Check_Equal (Image (Value (R, 1, "BLOB")), "DEADBEEF",
                             "BLOB cell");

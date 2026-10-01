@@ -28,8 +28,8 @@ package Frostlake is
    Version : constant String := "0.1.0";
 
    ---------------------------------------------------------------------
-   --  Errors.  Ada has no exception hierarchy, so the three kinds every
-   --  Frostlake driver distinguishes are three sibling exceptions.
+   --  Errors.  Ada has no exception hierarchy, so the kinds every
+   --  Frostlake driver distinguishes are sibling exceptions.
    ---------------------------------------------------------------------
 
    --  The server could not be reached, or the connection failed
@@ -43,6 +43,16 @@ package Frostlake is
    --  closed connection, a bind value with no SQL equivalent.
    Usage_Error : exception;
 
+   --  The engine no longer holds the connection's session — it expired,
+   --  was released, or the server restarted — and what the session held
+   --  went with it: an open transaction, or context set up on it (a USE,
+   --  SET or ALTER SESSION, a temporary object).  The statement did NOT
+   --  run.  The connection stays usable, and its next statement starts a
+   --  fresh session on the DSN's scope.  (A lost session that held nothing
+   --  a fresh one lacks raises nothing: the statement is sent once more in
+   --  a fresh session on the DSN's scope.)
+   Session_Lost_Error : exception;
+
    ---------------------------------------------------------------------
    --  Defaults.
    ---------------------------------------------------------------------
@@ -54,8 +64,11 @@ package Frostlake is
    Default_Open_Timeout : constant Duration := 10.0;
    Default_Read_Timeout : constant Duration := 300.0;
 
-   --  The engine reaps a session after 30 minutes idle.  Past that we have
-   --  to assume ours is gone, because nothing in a response says so.
+   --  The engine reaps a session after 30 minutes idle.  An engine that
+   --  answers newSession refuses the lapsed session instead, which the
+   --  driver recovers from where it lands; against one from before the
+   --  field, past this limit we have to assume ours is gone, because
+   --  nothing in a response says so.
    Default_Session_Idle_Limit : constant Duration := 1800.0;
 
    --  "Not given" for Connect's optional arguments: an explicit argument
@@ -309,11 +322,26 @@ package Frostlake is
    --  BEGIN, Work, COMMIT — rolling back on any exception and re-raising
    --  it (a failed rollback never replaces the exception that caused it).
 
+   function In_Transaction (Conn : Connection) return Boolean;
+   --  Whether a transaction is open on the session: from Begin_Transaction,
+   --  or a BEGIN or START TRANSACTION sent as a statement, until its COMMIT
+   --  or ROLLBACK.
+
+   function Session (Conn : Connection) return String;
+   --  The engine's id for the connection's session, or "" before the
+   --  first statement, after a lost session was dropped, and once closed.
+
    procedure Close (Conn : in out Connection);
    function Is_Closed (Conn : Connection) return Boolean;
    --  Closing is idempotent; every other operation on a closed connection
    --  raises Usage_Error.  A Connection also closes itself when it goes
-   --  out of scope.
+   --  out of scope.  Closing gives the engine its session back with
+   --  DELETE /api/sessions/{id}, which also rolls back a transaction left
+   --  open on it — best effort: it waits no longer than five seconds (or
+   --  the connection's own shorter timeouts), never raises, and only the
+   --  first close sends it.  An engine that answers no newSession has no
+   --  such endpoint and is sent nothing; its session lingers until the
+   --  engine's idle expiry.
 
    function Last_Error_Message (Conn : Connection) return String;
    --  The engine's message from the most recent Query_Error, in full.
@@ -327,6 +355,13 @@ private
      (Index_Type   => Positive,
       Element_Type => Ada.Strings.Unbounded.Unbounded_String,
       "="          => Ada.Strings.Unbounded."=");
+
+   --  What the engine is known to do with the session id a request names.
+   --  An engine that answers newSession (Tracked) also honours
+   --  requireSession and DELETE /api/sessions/{id}; one from before the
+   --  field (Untracked) knows neither, and its parser may refuse a field it
+   --  does not know.
+   type Session_Support is (Unknown, Tracked, Untracked);
 
    --  One statement at a time per connection: statements serialize so a
    --  Connection can be shared between tasks without interleaving them —
@@ -352,9 +387,17 @@ private
       Auto_Commit : Boolean := True;
       Closed      : Boolean := False;
 
-      --  Whether the caller has selected anything themselves; if they
-      --  have, the DSN's defaults are no longer the whole truth about
-      --  this session.
+      --  Whether the engine keeps sessions to their id.  Unknown until the
+      --  first answer that names a session.
+      Sessions : Session_Support := Unknown;
+      --  A transaction is open: from BEGIN (however it was sent) until
+      --  COMMIT or ROLLBACK.
+      Transaction_Open : Boolean := False;
+
+      --  Whether a statement has left state behind that a fresh session
+      --  would not have — a scope the caller selected themselves, a
+      --  variable, a setting, a temporary object.  Once it has, the DSN's
+      --  defaults are no longer the whole truth about this session.
       Session_Touched : Boolean := False;
       Has_Last_Used   : Boolean := False;
       Last_Used_At    : Ada.Real_Time.Time := Ada.Real_Time.Time_First;

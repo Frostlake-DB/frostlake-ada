@@ -375,4 +375,289 @@ package body Frostlake.Sql is
       return False;
    end Selects_Session_State;
 
+   ------------------------------------------
+   --  Touches_Session, Transaction_Effect --
+   ------------------------------------------
+
+   --  Just past the literal, quoted identifier, $$ body or comment opening
+   --  at I, or 0 when I is code: the rules Substitute follows, so binding and
+   --  session tracking cannot disagree about what is code.
+   function Skip_Non_Code (Sql : String; I : Positive) return Natural is
+      Next : constant Character :=
+        (if I < Sql'Last then Sql (I + 1) else Character'Val (0));
+      J    : Natural;
+
+      function Line_End return Natural is
+      begin
+         for K in I .. Sql'Last loop
+            if Sql (K) = Character'Val (10) then
+               return K + 1;
+            end if;
+         end loop;
+         return Sql'Last + 1;
+      end Line_End;
+
+      function Pair_End (Mark : String) return Natural is
+      begin
+         for K in I + 2 .. Sql'Last - 1 loop
+            if Sql (K .. K + 1) = Mark then
+               return K + 2;
+            end if;
+         end loop;
+         return Sql'Last + 1;
+      end Pair_End;
+
+   begin
+      case Sql (I) is
+         when ''' =>
+            --  A backslash always escapes; '' is a doubled quote.
+            J := I + 1;
+            while J <= Sql'Last loop
+               if Sql (J) = '\' then
+                  J := J + 2;
+               elsif Sql (J) = ''' then
+                  if J < Sql'Last and then Sql (J + 1) = ''' then
+                     J := J + 2;
+                  else
+                     return J + 1;
+                  end if;
+               else
+                  J := J + 1;
+               end if;
+            end loop;
+            return Sql'Last + 1;
+         when '"' =>
+            J := I + 1;
+            while J <= Sql'Last loop
+               if Sql (J) = '"' then
+                  if J < Sql'Last and then Sql (J + 1) = '"' then
+                     J := J + 2;
+                  else
+                     return J + 1;
+                  end if;
+               else
+                  J := J + 1;
+               end if;
+            end loop;
+            return Sql'Last + 1;
+         when '-' =>
+            return (if Next = '-' then Line_End else 0);
+         when '/' =>
+            if Next = '/' then
+               return Line_End;
+            elsif Next = '*' then
+               return Pair_End ("*/");
+            end if;
+            return 0;
+         when '$' =>
+            return (if Next = '$' then Pair_End ("$$") else 0);
+         when others =>
+            return 0;
+      end case;
+   end Skip_Non_Code;
+
+   --  Calls Visit with each top-level statement of Sql.
+   generic
+      with procedure Visit (Statement : String);
+   procedure For_Each_Statement (Sql : String);
+
+   procedure For_Each_Statement (Sql : String) is
+      Start : Natural := Sql'First;
+      I     : Natural := Sql'First;
+   begin
+      while I <= Sql'Last loop
+         declare
+            Past : constant Natural := Skip_Non_Code (Sql, I);
+         begin
+            if Past > 0 then
+               I := Past;
+            elsif Sql (I) = ';' then
+               Visit (Sql (Start .. I - 1));
+               I := I + 1;
+               Start := I;
+            else
+               I := I + 1;
+            end if;
+         end;
+      end loop;
+      Visit (Sql (Start .. Sql'Last));
+   end For_Each_Statement;
+
+   function Is_Word_Char (C : Character) return Boolean is
+     (C in 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' | '$'
+      or else Character'Pos (C) >= 128);
+
+   type Word_List is array (1 .. 16) of Unbounded_String;
+
+   --  Up to Words'Length leading words of Statement, upper-cased, stepping
+   --  over whitespace and comments and stopping at the first thing that is
+   --  not a word.
+   procedure Leading_Words
+     (Statement : String;
+      Words     : out Word_List;
+      Count     : out Natural)
+   is
+      I : Natural := Statement'First;
+   begin
+      Count := 0;
+      while I <= Statement'Last and then Count < Words'Length loop
+         declare
+            C    : constant Character := Statement (I);
+            Next : constant Character :=
+              (if I < Statement'Last then Statement (I + 1)
+               else Character'Val (0));
+         begin
+            if Is_Space (C) then
+               I := I + 1;
+            elsif (C = '-' and then Next = '-')
+              or else (C = '/' and then (Next = '/' or else Next = '*'))
+            then
+               I := Skip_Non_Code (Statement, I);
+            elsif Is_Word_Char (C) then
+               declare
+                  Start : constant Positive := I;
+               begin
+                  while I <= Statement'Last
+                    and then Is_Word_Char (Statement (I))
+                  loop
+                     I := I + 1;
+                  end loop;
+                  Count := Count + 1;
+                  Words (Count) := Null_Unbounded_String;
+                  for K in Start .. I - 1 loop
+                     Append (Words (Count), Upper (Statement (K)));
+                  end loop;
+               end;
+            else
+               exit;
+            end if;
+         end;
+      end loop;
+   end Leading_Words;
+
+   --  The words that may sit between CREATE/DROP/ALTER and the kind of
+   --  object being named.
+   function Is_Modifier (Word : String) return Boolean is
+     (Word = "OR" or else Word = "REPLACE" or else Word = "TRANSIENT"
+      or else Word = "TEMPORARY" or else Word = "TEMP"
+      or else Word = "VOLATILE" or else Word = "LOCAL"
+      or else Word = "GLOBAL" or else Word = "SECURE" or else Word = "IF"
+      or else Word = "NOT" or else Word = "EXISTS" or else Word = "PUBLIC"
+      or else Word = "PRIVATE" or else Word = "ICEBERG"
+      or else Word = "DYNAMIC" or else Word = "HYBRID"
+      or else Word = "EVENT" or else Word = "RECURSIVE"
+      or else Word = "MATERIALIZED" or else Word = "EXTERNAL");
+
+   function Statement_Touches_Session (Statement : String) return Boolean
+   is
+      Words : Word_List;
+      Count : Natural;
+      Past  : Positive := 2;  --  the first word past the modifiers
+   begin
+      Leading_Words (Statement, Words, Count);
+      if Count = 0 then
+         return False;
+      end if;
+      declare
+         Verb : constant String := To_String (Words (1));
+      begin
+         if Verb = "USE" or else Verb = "SET" or else Verb = "UNSET" then
+            return True;
+         end if;
+         while Past <= Count
+           and then Is_Modifier (To_String (Words (Past)))
+         loop
+            Past := Past + 1;
+         end loop;
+         declare
+            Object : constant String :=
+              (if Past <= Count then To_String (Words (Past)) else "");
+         begin
+            if Verb = "ALTER" then
+               return Object = "SESSION";
+            elsif Verb /= "CREATE" and then Verb /= "DROP" then
+               return False;
+            elsif Object = "DATABASE" or else Object = "SCHEMA" then
+               return True;
+            elsif Verb = "CREATE" then
+               for K in 2 .. Past - 1 loop
+                  declare
+                     Word : constant String := To_String (Words (K));
+                  begin
+                     if Word = "TEMPORARY" or else Word = "TEMP"
+                       or else Word = "VOLATILE"
+                     then
+                        return True;
+                     end if;
+                  end;
+               end loop;
+            end if;
+            return False;
+         end;
+      end;
+   end Statement_Touches_Session;
+
+   function Statement_Effect (Statement : String) return Transaction_Change
+   is
+      Words : Word_List;
+      Count : Natural;
+   begin
+      Leading_Words (Statement, Words, Count);
+      if Count = 0 then
+         return No_Change;
+      end if;
+      declare
+         First  : constant String := To_String (Words (1));
+         Second : constant String :=
+           (if Count >= 2 then To_String (Words (2)) else "");
+      begin
+         if First = "BEGIN" then
+            if Count = 1 or else Second = "TRANSACTION"
+              or else Second = "WORK" or else Second = "NAME"
+            then
+               return Opens;
+            end if;
+            return No_Change;
+         elsif First = "START" and then Second = "TRANSACTION" then
+            return Opens;
+         elsif First = "COMMIT" or else First = "ROLLBACK" then
+            return Closes;
+         end if;
+         return No_Change;
+      end;
+   end Statement_Effect;
+
+   function Touches_Session (Sql : String) return Boolean is
+      Found : Boolean := False;
+
+      procedure Visit (Statement : String) is
+      begin
+         if not Found and then Statement_Touches_Session (Statement) then
+            Found := True;
+         end if;
+      end Visit;
+
+      procedure Each is new For_Each_Statement (Visit);
+   begin
+      Each (Sql);
+      return Found;
+   end Touches_Session;
+
+   function Transaction_Effect (Sql : String) return Transaction_Change is
+      Effect : Transaction_Change := No_Change;
+
+      procedure Visit (Statement : String) is
+         Change : constant Transaction_Change := Statement_Effect (Statement);
+      begin
+         if Change /= No_Change then
+            Effect := Change;
+         end if;
+      end Visit;
+
+      procedure Each is new For_Each_Statement (Visit);
+   begin
+      Each (Sql);
+      return Effect;
+   end Transaction_Effect;
+
 end Frostlake.Sql;

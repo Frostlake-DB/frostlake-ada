@@ -165,7 +165,8 @@ package body Frostlake.Wire is
      (Sql                   : String;
       Session_Id            : String;
       Auto_Commit           : Boolean;
-      Multi_Statement_Count : Integer := No_Multi_Statement_Count)
+      Multi_Statement_Count : Integer := No_Multi_Statement_Count;
+      Require_Session       : Boolean := False)
       return String
    is
       Out_Text : Unbounded_String;
@@ -178,6 +179,9 @@ package body Frostlake.Wire is
          Append (Out_Text, ",""sessionId"":""");
          Append (Out_Text, Escape_Json (Session_Id));
          Append (Out_Text, """");
+         if Require_Session then
+            Append (Out_Text, ",""requireSession"":true");
+         end if;
       end if;
       if Multi_Statement_Count /= No_Multi_Statement_Count then
          Append (Out_Text, ",""multiStatementCount"":");
@@ -1160,6 +1164,18 @@ package body Frostlake.Wire is
                if Peek = '"' then
                   Out_Response.Session_Id := Parse_String_Value;
                   Out_Response.Has_Session_Id := True;
+               else
+                  Skip_Value;
+               end if;
+            elsif Key = "newSession" then
+               if Peek = 't' then
+                  Expect_Word ("true");
+                  Out_Response.New_Session := True;
+                  Out_Response.Has_New_Session := True;
+               elsif Peek = 'f' then
+                  Expect_Word ("false");
+                  Out_Response.New_Session := False;
+                  Out_Response.Has_New_Session := True;
                else
                   Skip_Value;
                end if;

@@ -836,13 +836,92 @@ package body Frostlake is
       end if;
    end Check_Open;
 
-   --  One statement over the wire; the caller holds the lock.
+   --  Put the DSN's own USE statements back in the queue, so the next
+   --  statement runs in the scope the connection string asked for.  Not once
+   --  the caller has selected something themselves: putting our defaults over
+   --  their choice is its own surprise.
+   procedure Queue_Session_Defaults (Conn : in out Connection) is
+   begin
+      if Conn.Session_Defaults.Is_Empty or else Conn.Session_Touched then
+         return;
+      end if;
+      for I in 1 .. Conn.Session_Defaults.Last_Index loop
+         Conn.Pending_Use.Append (Conn.Session_Defaults.Element (I));
+      end loop;
+   end Queue_Session_Defaults;
+
+   --  The engine refused the session id a request required as one it no
+   --  longer holds, and nothing ran.  Raised by Round_Trip and handled in
+   --  this body: it never reaches a caller.
+   Session_Gone : exception;
+
+   Refused_Again : constant String :=
+     "the engine refused a session it had just started for this"
+     & " connection; the statement did not run";
+
+   --  Nothing is left of what the session held — it was lost, or the
+   --  engine ran a request in a fresh session in place of it — so the
+   --  DSN's scope goes back on before the next statement, and a
+   --  transaction is over.
+   procedure Forget_Session (Conn : in out Connection) is
+   begin
+      Conn.Auto_Commit := True;
+      Conn.Transaction_Open := False;
+      Conn.Session_Touched := False;
+      Conn.Pending_Use := Conn.Session_Defaults;
+   end Forget_Session;
+
+   procedure Drop_Session (Conn : in out Connection) is
+   begin
+      Conn.Session_Id := Null_Unbounded_String;
+      Forget_Session (Conn);
+   end Drop_Session;
+
+   --  The engine no longer holds this connection's session — it expired,
+   --  was released, or the server restarted — and nothing ran.  The id is
+   --  dropped and the DSN's scope queued for a fresh session.  When the
+   --  lost session held an open transaction, or context set up on it,
+   --  re-running the statement would put it somewhere its author did not
+   --  intend, so Session_Lost_Error says so instead.  Either way the
+   --  connection stays usable, and its next statement starts on the DSN's
+   --  scope.  (GNAT cuts exception messages near 200 characters, so these
+   --  stay short.)
+   procedure Lose_Session (Conn : in out Connection) is
+      Had_Transaction : constant Boolean := Conn.Transaction_Open;
+      Had_Context     : constant Boolean := Conn.Session_Touched;
+   begin
+      Drop_Session (Conn);
+      if Had_Transaction then
+         raise Session_Lost_Error with
+           "the engine no longer holds this connection's session, so its"
+           & " open transaction is gone; the statement did not run";
+      end if;
+      if Had_Context then
+         raise Session_Lost_Error with
+           "the engine no longer holds this connection's session, and the"
+           & " context set up on it (USE, SET, ALTER SESSION, a temporary"
+           & " object) went with it; the statement did not run";
+      end if;
+   end Lose_Session;
+
+   --  One statement over the wire, without any recovery, carrying
+   --  Auto_Commit as its autoCommit; the caller holds the lock.
    function Round_Trip
      (Conn                  : in out Connection;
       Rendered              : String;
+      Auto_Commit           : Boolean;
       Multi_Statement_Count : Integer := No_Multi_Statement_Count)
       return Wire.Response
    is
+      Had_Session : constant Boolean :=
+        Ada.Strings.Unbounded.Length (Conn.Session_Id) > 0;
+      --  Resume the session or refuse: without this, an engine that no
+      --  longer holds it starts a fresh one under the same id and the
+      --  statement runs in the wrong context.  Sent only once the engine is
+      --  known to honour it: an older one's parser may refuse a field it
+      --  does not know.
+      Require     : constant Boolean :=
+        Had_Session and then Conn.Sessions = Tracked;
       Reply : constant Http.Reply :=
         Http.Post
           (Host         => To_String (Conn.Host),
@@ -852,12 +931,13 @@ package body Frostlake is
                              (Sql                   => Rendered,
                               Session_Id            =>
                                 To_String (Conn.Session_Id),
-                              Auto_Commit           => Conn.Auto_Commit,
+                              Auto_Commit           => Auto_Commit,
                               Multi_Statement_Count =>
-                                Multi_Statement_Count),
+                                Multi_Statement_Count,
+                              Require_Session       => Require),
            Open_Timeout => Conn.Open_Timeout,
            Read_Timeout => Conn.Read_Timeout);
-      Parsed : Wire.Response;
+      Parsed      : Wire.Response;
    begin
       --  Failed statements still answer with the error payload in the
       --  body, so the body is read regardless of the status code.
@@ -869,8 +949,31 @@ package body Frostlake is
               "HTTP" & Natural'Image (Reply.Status)
               & " with unreadable body";
       end;
+      if Require and then Reply.Status = 404 and then not Parsed.Success
+        and then not Parsed.Has_Session_Id
+      then
+         raise Session_Gone;
+      end if;
       if Parsed.Has_Session_Id then
          Conn.Session_Id := Parsed.Session_Id;
+         --  The first answer that names a session says whether the engine
+         --  keeps sessions to their id: one that does answers newSession.
+         if Parsed.Has_New_Session then
+            Conn.Sessions := Tracked;
+         elsif Conn.Sessions = Unknown then
+            Conn.Sessions := Untracked;
+         end if;
+      end if;
+      --  The server says outright when it ran a request in a session it
+      --  started under the id we sent, which is what happens once ours has
+      --  been reaped or released and nothing required it.  The statement
+      --  has already run in that fresh session, so what the old one held is
+      --  forgotten and the defaults go back on for the NEXT statement —
+      --  there is no retracting a statement that has run.
+      if Had_Session and then Parsed.Has_New_Session
+        and then Parsed.New_Session
+      then
+         Forget_Session (Conn);
       end if;
       if not Parsed.Success then
          if Parsed.Has_Error_Message then
@@ -885,16 +988,22 @@ package body Frostlake is
       return Parsed;
    end Round_Trip;
 
-   --  The engine reaps a session once it has been idle long enough and
-   --  then quietly builds a fresh one for the id we keep sending, losing
-   --  the database and schema we selected.  Nothing in the reply gives it
-   --  away, so past the limit the only safe reading is that the session
-   --  is new, and the DSN's defaults go back on.  Not once the caller has
-   --  selected something themselves: putting our defaults over their
-   --  choice is its own surprise.
+   --  The engine reaps a session once it has been idle long enough.  One
+   --  that answers newSession then refuses the id, and the refusal is
+   --  recovered from where it lands.  One from before the field quietly
+   --  builds a fresh session for the id we keep sending, losing the
+   --  database and schema we selected, and nothing in the reply gives it
+   --  away — so against such an engine, past the limit the only safe
+   --  reading is that the session is new, and the DSN's defaults go back
+   --  on.  Not once the caller has selected something themselves, nor
+   --  inside a transaction: putting our defaults over their choice is its
+   --  own surprise.
    procedure Restore_Session_Defaults (Conn : in out Connection) is
       use Ada.Real_Time;
    begin
+      if Conn.Sessions /= Untracked or else Conn.Transaction_Open then
+         return;
+      end if;
       if Conn.Session_Defaults.Is_Empty or else Conn.Session_Touched then
          return;
       end if;
@@ -904,12 +1013,16 @@ package body Frostlake is
       if To_Duration (Clock - Conn.Last_Used_At) < Conn.Idle_Limit then
          return;
       end if;
-      for I in 1 .. Conn.Session_Defaults.Last_Index loop
-         Conn.Pending_Use.Append (Conn.Session_Defaults.Element (I));
-      end loop;
+      Queue_Session_Defaults (Conn);
    end Restore_Session_Defaults;
 
+   --  Puts the owed USE statements on the session.  A session lost part
+   --  way through takes the USEs already run with it, so the whole scope
+   --  starts over in a fresh session — once.  With the whole scope on, the
+   --  session holds nothing the caller put there.
    procedure Drain_Pending (Conn : in out Connection) is
+      Restarted : Boolean := False;
+      Drained   : Boolean := False;
    begin
       while not Conn.Pending_Use.Is_Empty loop
          declare
@@ -917,16 +1030,77 @@ package body Frostlake is
               To_String (Conn.Pending_Use.First_Element);
          begin
             Conn.Pending_Use.Delete_First;
+            Drained := True;
             declare
                Ignored : constant Wire.Response :=
-                 Round_Trip (Conn, Statement);
+                 Round_Trip (Conn, Statement, Conn.Auto_Commit);
                pragma Unreferenced (Ignored);
             begin
                null;
             end;
+         exception
+            when Session_Gone =>
+               if Restarted then
+                  Drop_Session (Conn);
+                  raise Session_Lost_Error with Refused_Again;
+               end if;
+               Restarted := True;
+               Lose_Session (Conn);
          end;
       end loop;
+      if Drained then
+         Conn.Session_Touched := False;
+      end if;
    end Drain_Pending;
+
+   --  One statement, recovering from a session the engine no longer holds.
+   --  Nothing ran then: when the session held nothing a fresh one lacks,
+   --  the DSN's scope goes onto a fresh session and the statement is sent
+   --  once more, exactly as it was first sent — Auto_Commit both times;
+   --  when it held an open transaction or context, Lose_Session refuses
+   --  instead.  A second refusal raises.
+   function Recovering_Round_Trip
+     (Conn                  : in out Connection;
+      Rendered              : String;
+      Auto_Commit           : Boolean;
+      Multi_Statement_Count : Integer := No_Multi_Statement_Count)
+      return Wire.Response is
+   begin
+      begin
+         return Round_Trip
+           (Conn, Rendered, Auto_Commit, Multi_Statement_Count);
+      exception
+         when Session_Gone =>
+            null;
+      end;
+      Lose_Session (Conn);
+      Drain_Pending (Conn);
+      begin
+         return Round_Trip
+           (Conn, Rendered, Auto_Commit, Multi_Statement_Count);
+      exception
+         when Session_Gone =>
+            Drop_Session (Conn);
+            raise Session_Lost_Error with Refused_Again;
+      end;
+   end Recovering_Round_Trip;
+
+   --  What a statement that ran left on the session: context a fresh
+   --  session would not have, and whether a transaction is open.
+   procedure Track (Conn : in out Connection; Sql : String) is
+   begin
+      if Sql_Text.Touches_Session (Sql) then
+         Conn.Session_Touched := True;
+      end if;
+      case Sql_Text.Transaction_Effect (Sql) is
+         when Sql_Text.Opens =>
+            Conn.Transaction_Open := True;
+         when Sql_Text.Closes =>
+            Conn.Transaction_Open := False;
+         when Sql_Text.No_Change =>
+            null;
+      end case;
+   end Track;
 
    function Shaped (Sets : Result_Vectors.Vector)
       return Result_Vectors.Vector
@@ -960,11 +1134,14 @@ package body Frostlake is
 
    --  The pending USE statements and the statement itself have to reach
    --  the session as one unit: another task must not slip a query in
-   --  between.  The caller holds the lock.
+   --  between.  The caller holds the lock.  The statement carries
+   --  Auto_Commit as its autoCommit, the pending USE statements the
+   --  connection's own.
    function Locked_Execute_All
      (Conn                  : in out Connection;
       Original              : String;
       Rendered              : String;
+      Auto_Commit           : Boolean;
       Multi_Statement_Count : Integer := No_Multi_Statement_Count)
       return Result_Vectors.Vector is
    begin
@@ -974,13 +1151,12 @@ package body Frostlake is
       Drain_Pending (Conn);
       declare
          Parsed : constant Wire.Response :=
-           Round_Trip (Conn, Rendered, Multi_Statement_Count);
+           Recovering_Round_Trip
+             (Conn, Rendered, Auto_Commit, Multi_Statement_Count);
          Out_V  : constant Result_Vectors.Vector :=
            Shaped (Parsed.Result_Sets);
       begin
-         if Sql_Text.Selects_Session_State (Original) then
-            Conn.Session_Touched := True;
-         end if;
+         Track (Conn, Original);
          return Out_V;
       end;
    end Locked_Execute_All;
@@ -1079,7 +1255,7 @@ package body Frostlake is
       begin
          declare
             Out_V : constant Result_Vectors.Vector :=
-              Locked_Execute_All (Conn, Sql, Rendered,
+              Locked_Execute_All (Conn, Sql, Rendered, Conn.Auto_Commit,
                                   Multi_Statement_Count);
          begin
             Conn.Lock.Release;
@@ -1123,14 +1299,22 @@ package body Frostlake is
       Check_Open (Conn);
       Conn.Lock.Seize;
       begin
-         Conn.Auto_Commit := False;
+         --  BEGIN goes out with autocommit off, as every statement of the
+         --  transaction it opens does, but the connection turns autocommit
+         --  off only once BEGIN has run — within this same hold of the lock,
+         --  so no statement waiting on it sees a half-made transaction.  A
+         --  BEGIN that failed (the transport broke, a queued USE was
+         --  refused) leaves the connection autocommitting rather than
+         --  running what follows in an implicit transaction nobody opened.
          declare
             Ignored : constant Result_Vectors.Vector :=
-              Locked_Execute_All (Conn, "BEGIN", "BEGIN");
+              Locked_Execute_All
+                (Conn, "BEGIN", "BEGIN", Auto_Commit => False);
             pragma Unreferenced (Ignored);
          begin
             null;
          end;
+         Conn.Auto_Commit := False;
       exception
          when others =>
             Conn.Lock.Release;
@@ -1146,7 +1330,7 @@ package body Frostlake is
       begin
          declare
             Ignored : constant Result_Vectors.Vector :=
-              Locked_Execute_All (Conn, "COMMIT", "COMMIT");
+              Locked_Execute_All (Conn, "COMMIT", "COMMIT", Conn.Auto_Commit);
             pragma Unreferenced (Ignored);
          begin
             null;
@@ -1167,7 +1351,8 @@ package body Frostlake is
       begin
          declare
             Ignored : constant Result_Vectors.Vector :=
-              Locked_Execute_All (Conn, "ROLLBACK", "ROLLBACK");
+              Locked_Execute_All
+                (Conn, "ROLLBACK", "ROLLBACK", Conn.Auto_Commit);
             pragma Unreferenced (Ignored);
          begin
             null;
@@ -1189,22 +1374,92 @@ package body Frostlake is
          Commit (Conn);
       exception
          when others =>
-            begin
-               Rollback (Conn);
-            exception
-               when others =>
-                  --  A failed rollback must not replace the exception
-                  --  that caused it.
-                  null;
-            end;
+            --  A transaction already gone — with a lost session, say —
+            --  needs no rollback.
+            if Conn.Transaction_Open or else not Conn.Auto_Commit then
+               begin
+                  Rollback (Conn);
+               exception
+                  when others =>
+                     --  A failed rollback must not replace the exception
+                     --  that caused it.
+                     null;
+               end;
+            end if;
             raise;
       end;
    end Run_In_Transaction;
 
+   --  How long releasing the session may wait on each of connecting and
+   --  reading, when the connection's own timeouts are longer.
+   Release_Budget : constant Duration := 5.0;
+
+   --  A session id as one path segment: anything but an unreserved
+   --  character is percent-encoded.
+   function Path_Segment (Text : String) return String is
+      Out_Text : Unbounded_String;
+   begin
+      for C of Text loop
+         if C in 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '-' | '_' | '.' | '~'
+         then
+            Append (Out_Text, C);
+         else
+            Append (Out_Text, '%');
+            Append (Out_Text, Hex_Digit (Character'Pos (C) / 16));
+            Append (Out_Text, Hex_Digit (Character'Pos (C) mod 16));
+         end if;
+      end loop;
+      return To_String (Out_Text);
+   end Path_Segment;
+
+   --  Hand the session back rather than leaving it to the reaper — only to
+   --  an engine known to have the route, which is one that answers
+   --  newSession.  Anything the server says is its own business, an
+   --  unreachable one raises, and neither is a reason for closing to fail.
+   --  Closing stays idempotent, so the id is dropped whatever happens and a
+   --  second close sends nothing.
+   procedure Release_Session (Conn : in out Connection) is
+   begin
+      if Ada.Strings.Unbounded.Length (Conn.Session_Id) = 0 then
+         return;
+      end if;
+      declare
+         Path : constant String :=
+           "/api/sessions/" & Path_Segment (To_String (Conn.Session_Id));
+      begin
+         Conn.Session_Id := Null_Unbounded_String;
+         if Conn.Sessions /= Tracked then
+            return;
+         end if;
+         declare
+            Ignored : constant Http.Reply :=
+              Http.Delete
+                (Host         => To_String (Conn.Host),
+                 Port         => Conn.Port,
+                 Path         => Path,
+                 Open_Timeout =>
+                   Duration'Min (Conn.Open_Timeout, Release_Budget),
+                 Read_Timeout =>
+                   Duration'Min (Conn.Read_Timeout, Release_Budget));
+            pragma Unreferenced (Ignored);
+         begin
+            null;
+         end;
+      end;
+   exception
+      when others =>
+         null;
+   end Release_Session;
+
    procedure Close (Conn : in out Connection) is
    begin
-      --  No socket outlives a request, so closing is only a refusal to
-      --  be used again.
+      --  No socket outlives a request, so closing is only a refusal to be
+      --  used again — but the SERVER's session outlives it, with whatever
+      --  transaction and temporary objects it holds, until the reaper gets
+      --  to it. Releasing it says so at once.
+      if not Conn.Closed then
+         Release_Session (Conn);
+      end if;
       Conn.Closed := True;
    end Close;
 
@@ -1213,13 +1468,29 @@ package body Frostlake is
       return Conn.Closed;
    end Is_Closed;
 
+   function In_Transaction (Conn : Connection) return Boolean is
+   begin
+      return Conn.Transaction_Open;
+   end In_Transaction;
+
+   function Session (Conn : Connection) return String is
+   begin
+      return To_String (Conn.Session_Id);
+   end Session;
+
    function Last_Error_Message (Conn : Connection) return String is
    begin
       return To_String (Conn.Last_Error);
    end Last_Error_Message;
 
+   --  Going out of scope closes the connection the way Close does, its
+   --  session released with it.  Release_Session lets nothing escape, so
+   --  finalization cannot fail.
    overriding procedure Finalize (Conn : in out Connection) is
    begin
+      if not Conn.Closed then
+         Release_Session (Conn);
+      end if;
       Conn.Closed := True;
    end Finalize;
 

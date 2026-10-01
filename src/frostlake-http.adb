@@ -29,8 +29,12 @@ package body Frostlake.Http is
    end Lower;
 
    --  The address for Host: a numeric literal as itself, a name through
-   --  the resolver.
-   function Resolve (Host : String) return GNAT.Sockets.Inet_Addr_Type is
+   --  the resolver.  A name the resolver cannot place leaves the endpoint
+   --  Where as unreachable as a refused connection does.
+   function Resolve
+     (Host  : String;
+      Where : String) return GNAT.Sockets.Inet_Addr_Type
+   is
       use GNAT.Sockets;
    begin
       begin
@@ -44,10 +48,15 @@ package body Frostlake.Http is
       begin
          if Addresses_Length (Entry_Of) = 0 then
             raise Connection_Error with
-              "cannot resolve host " & Host;
+              "cannot reach " & Where & ": no address for " & Host;
          end if;
          return Addresses (Entry_Of, 1);
       end;
+   exception
+      when E : Host_Error | Socket_Error =>
+         raise Connection_Error with
+           "cannot reach " & Where & ": "
+           & Ada.Exceptions.Exception_Message (E);
    end Resolve;
 
    --  One whole request-response exchange on a fresh connection.
@@ -145,6 +154,11 @@ package body Frostlake.Http is
             begin
                for I in Space + 1 .. Head'Last loop
                   exit when Head (I) not in '0' .. '9';
+                  --  A status code is three digits; a fourth makes it none.
+                  if I - Space > 3 then
+                     raise Connection_Error with
+                       "unintelligible response from " & Where;
+                  end if;
                   Code := Code * 10 + (Character'Pos (Head (I))
                                        - Character'Pos ('0'));
                   Saw := True;
@@ -180,31 +194,48 @@ package body Frostlake.Http is
                if Colon > Line_Start then
                   declare
                      Name : String (1 .. Colon - Line_Start);
-                     OK   : Boolean := True;
                   begin
                      for I in Name'Range loop
                         Name (I) := Lower (Head (Line_Start + I - 1));
                      end loop;
                      if Name = "content-length" then
+                        --  Digits with nothing but whitespace around them;
+                        --  anything else is no length at all.
                         declare
+                           Pos   : Natural := Colon + 1;
                            Value : Natural := 0;
+                           Digit : Natural;
                            Saw   : Boolean := False;
                         begin
-                           for I in Colon + 1 .. Line_End loop
-                              if Head (I) in '0' .. '9' then
-                                 Value := Value * 10
-                                   + (Character'Pos (Head (I))
-                                      - Character'Pos ('0'));
-                                 Saw := True;
-                              elsif Head (I) /= ' '
-                                and then Head (I) /= Character'Val (9)
-                              then
-                                 OK := False;
-                              end if;
+                           while Pos <= Line_End
+                             and then Head (Pos) in ' ' | Character'Val (9)
+                           loop
+                              Pos := Pos + 1;
                            end loop;
-                           if Saw and then OK then
-                              Content_Length := Value;
+                           while Pos <= Line_End
+                             and then Head (Pos) in '0' .. '9'
+                           loop
+                              Digit := Character'Pos (Head (Pos))
+                                - Character'Pos ('0');
+                              --  No length past Natural'Last is readable.
+                              if Value > (Natural'Last - Digit) / 10 then
+                                 raise Connection_Error with
+                                   "unintelligible response from " & Where;
+                              end if;
+                              Value := Value * 10 + Digit;
+                              Saw := True;
+                              Pos := Pos + 1;
+                           end loop;
+                           while Pos <= Line_End
+                             and then Head (Pos) in ' ' | Character'Val (9)
+                           loop
+                              Pos := Pos + 1;
+                           end loop;
+                           if not Saw or else Pos <= Line_End then
+                              raise Connection_Error with
+                                "unintelligible response from " & Where;
                            end if;
+                           Content_Length := Value;
                         end;
                      end if;
                   end;
@@ -216,7 +247,7 @@ package body Frostlake.Http is
 
    begin
       declare
-         Address : constant Inet_Addr_Type := Resolve (Host);
+         Address : constant Inet_Addr_Type := Resolve (Host, Where);
          --  Assembled by component: Sock_Addr_Type has a variant part, so
          --  an aggregate would need a static family.
          Server  : Sock_Addr_Type (Address.Family);
@@ -305,6 +336,13 @@ package body Frostlake.Http is
          end if;
       end;
       return Out_Reply;
+   exception
+      when others =>
+         --  Whatever ends the exchange early, an unintelligible status line
+         --  from Read_Headers_Meta among them, takes the socket with it:
+         --  GNAT.Sockets never closes one by itself.
+         Drop;
+         raise;
    end Do_Request;
 
    function Post
@@ -346,5 +384,23 @@ package body Frostlake.Http is
       return Do_Request (Host, Port, Request_Text,
                          Open_Timeout, Read_Timeout);
    end Get;
+
+   function Delete
+     (Host         : String;
+      Port         : Positive;
+      Path         : String;
+      Open_Timeout : Duration;
+      Read_Timeout : Duration) return Reply
+   is
+      Request_Text : constant String :=
+        "DELETE " & Path & " HTTP/1.1" & CRLF
+        & "Host: " & Host & ':' & Trimmed (Positive'Image (Port)) & CRLF
+        & "Connection: close" & CRLF
+        & "Accept: application/json" & CRLF
+        & CRLF;
+   begin
+      return Do_Request (Host, Port, Request_Text,
+                         Open_Timeout, Read_Timeout);
+   end Delete;
 
 end Frostlake.Http;

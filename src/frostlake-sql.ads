@@ -29,6 +29,25 @@ package Frostlake.Sql is
    --  Whether the statement is a USE — the caller picking their own
    --  database, schema, warehouse or role for the session.
 
+   function Touches_Session (Sql : String) return Boolean;
+   --  Whether any statement of the request leaves behind state a fresh
+   --  session would not have: a moved scope (USE, or CREATE/DROP of a
+   --  DATABASE or SCHEMA), a session variable or setting (SET, UNSET, ALTER
+   --  SESSION), or a temporary object.  CREATE TABLE and its kind leave the
+   --  session as it was.  Statements are split on the semicolons outside
+   --  literals, quoted identifiers, $$...$$ bodies and comments; a
+   --  scripting block is split along with everything else, which only makes
+   --  the check more willing to say yes -- the safe direction.
+
+   type Transaction_Change is (No_Change, Opens, Closes);
+
+   function Transaction_Effect (Sql : String) return Transaction_Change;
+   --  What the request leaves the session's transaction as: the effect of
+   --  its last statement that opens one (BEGIN on its own or with
+   --  TRANSACTION, WORK or NAME; START TRANSACTION) or ends one (COMMIT,
+   --  ROLLBACK).  BEGIN followed by a statement opens a scripting block
+   --  instead, which is No_Change.
+
    function Is_Numeric_Literal (Text : String) return Boolean;
    --  Whether Text is a plain SQL numeric literal (optional sign, digits,
    --  optional fraction, optional exponent) — the only digit text safe to

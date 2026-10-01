@@ -18,18 +18,28 @@ package Frostlake.Wire is
       Error_Message     : Ada.Strings.Unbounded.Unbounded_String;
       Has_Error_Message : Boolean := False;
       Result_Sets       : Result_Vectors.Vector;
+      New_Session       : Boolean := False;
+      Has_New_Session   : Boolean := False;
    end record;
+   --  New_Session is the server's own word that it started a session under
+   --  the id the request carried, rather than reusing one it still had.  An
+   --  engine from before the field sends none, which Has_New_Session tells
+   --  apart from a server that sent False.
 
    function Build_Execute_Request
      (Sql                   : String;
       Session_Id            : String;
       Auto_Commit           : Boolean;
-      Multi_Statement_Count : Integer := No_Multi_Statement_Count)
+      Multi_Statement_Count : Integer := No_Multi_Statement_Count;
+      Require_Session       : Boolean := False)
       return String;
    --  {"sql":...,"autoCommit":...} plus "sessionId" when one is held and
    --  "multiStatementCount" when this request declares one.  Left at
    --  No_Multi_Statement_Count the field is absent altogether, which is
-   --  the body the server has always been sent.
+   --  the body the server has always been sent.  Require_Session adds
+   --  "requireSession":true beside a session id: the server then refuses
+   --  an id it no longer holds (HTTP 404, nothing run) instead of starting
+   --  a fresh session under it.
 
    function Parse_Response (Content : String) return Response;
    --  Reads the whole response object.  Cells are typed from their

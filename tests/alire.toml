@@ -7,7 +7,7 @@ maintainers = ["Michal Lorek <michal.lorek@gmail.com>"]
 maintainers-logins = ["mlorek"]
 licenses = "Apache-2.0"
 
-executables = ["frostlake_tests"]
+executables = ["frostlake_tests", "testkit_runner"]
 project-files = ["frostlake_tests.gpr"]
 
 [[depends-on]]

@@ -12,22 +12,81 @@ package body Loopback is
      (Index_Type   => Positive,
       Element_Type => Unbounded_String);
 
+   type Scripted_Reply is record
+      Status  : Natural := 200;
+      Content : Unbounded_String;
+   end record;
+
+   package Reply_Vectors is new Ada.Containers.Vectors
+     (Index_Type   => Positive,
+      Element_Type => Scripted_Reply);
+
    protected State is
       procedure Configure
         (Status_Code : Natural;
          Content     : String;
          With_Length : Boolean);
+      procedure Configure_Raw (Content : String);
+      procedure Configure_Script;
+      procedure Add_Scripted (Status_Code : Natural; Content : String);
+      procedure Take_Scripted
+        (Status_Code : out Natural;
+         Content     : out Unbounded_String);
       procedure Record_Request (Text : String);
+      procedure Record_Hang_Up;
       procedure Reset_Log;
       function Reply_Text return String;
+      function Holds return Boolean;
+      function Is_Scripted return Boolean;
       function Count return Natural;
+      function Hang_Up_Count return Natural;
       function Request (Index : Positive) return String;
    private
       Reply    : Unbounded_String;
+      Hold     : Boolean := False;
+      Scripted : Boolean := False;
+      Script   : Reply_Vectors.Vector;
+      Next     : Positive := 1;
       Requests : String_Vectors.Vector;
+      Hung_Up  : Natural := 0;
    end State;
 
    protected body State is
+
+      procedure Configure_Script is
+      begin
+         Scripted := True;
+         Hold := False;
+         Script.Clear;
+         Next := 1;
+      end Configure_Script;
+
+      procedure Add_Scripted (Status_Code : Natural; Content : String) is
+      begin
+         Script.Append
+           (Scripted_Reply'(Status  => Status_Code,
+                            Content => To_Unbounded_String (Content)));
+      end Add_Scripted;
+
+      procedure Take_Scripted
+        (Status_Code : out Natural;
+         Content     : out Unbounded_String) is
+      begin
+         if Next <= Script.Last_Index then
+            Status_Code := Script.Element (Next).Status;
+            Content := Script.Element (Next).Content;
+            Next := Next + 1;
+         else
+            Status_Code := 500;
+            Content := To_Unbounded_String
+              ("{""success"":false,""errorMessage"":""unscripted request""}");
+         end if;
+      end Take_Scripted;
+
+      function Is_Scripted return Boolean is
+      begin
+         return Scripted;
+      end Is_Scripted;
 
       procedure Configure
         (Status_Code : Natural;
@@ -57,16 +116,31 @@ package body Loopback is
          Append (Head, "Connection: close" & CRLF & CRLF);
          Append (Head, Content);
          Reply := Head;
+         Hold := False;
+         Scripted := False;
       end Configure;
+
+      procedure Configure_Raw (Content : String) is
+      begin
+         Reply := To_Unbounded_String (Content);
+         Hold := True;
+         Scripted := False;
+      end Configure_Raw;
 
       procedure Record_Request (Text : String) is
       begin
          Requests.Append (To_Unbounded_String (Text));
       end Record_Request;
 
+      procedure Record_Hang_Up is
+      begin
+         Hung_Up := Hung_Up + 1;
+      end Record_Hang_Up;
+
       procedure Reset_Log is
       begin
          Requests.Clear;
+         Hung_Up := 0;
       end Reset_Log;
 
       function Reply_Text return String is
@@ -74,10 +148,20 @@ package body Loopback is
          return To_String (Reply);
       end Reply_Text;
 
+      function Holds return Boolean is
+      begin
+         return Hold;
+      end Holds;
+
       function Count return Natural is
       begin
          return Natural (Requests.Length);
       end Count;
+
+      function Hang_Up_Count return Natural is
+      begin
+         return Hung_Up;
+      end Hang_Up_Count;
 
       function Request (Index : Positive) return String is
       begin
@@ -91,6 +175,11 @@ package body Loopback is
 
    Listener : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
    Have_Listener : Boolean := False;
+
+   --  How long a Start_Raw server waits for the client to let go of a
+   --  connection.  Well inside Stop's own wait, so a client that never lets
+   --  go still cannot outlast Stop.
+   Hold_Limit : constant Duration := 2.0;
 
    --  Closing a listening socket does NOT wake a task blocked in accept
    --  on Linux, so the acceptor polls with a short timeout and watches
@@ -135,6 +224,17 @@ package body Loopback is
       end Reset;
 
    end Control;
+
+   --  A scripted reply as it goes over the wire.
+   function Scripted_Text (Status : Natural; Content : String) return String
+   is
+      CRLF : constant String := Character'Val (13) & Character'Val (10);
+   begin
+      return "HTTP/1.1" & Natural'Image (Status) & " Scripted" & CRLF
+        & "Content-Type: application/json" & CRLF
+        & "Content-Length:" & Natural'Image (Content'Length) & CRLF
+        & "Connection: close" & CRLF & CRLF & Content;
+   end Scripted_Text;
 
    task type Acceptor_Task;
    type Acceptor_Access is access Acceptor_Task;
@@ -199,6 +299,42 @@ package body Loopback is
          return -1;
       end Content_Length_Of;
 
+      --  Keeps the connection open until the client closes its end, which a
+      --  read reports by returning nothing, and counts that.  A client that
+      --  never lets go runs into the receive timeout instead, whose
+      --  Socket_Error ends the hold uncounted.
+      procedure Await_Hang_Up (Client : Socket_Type) is
+         Buffer : Stream_Element_Array (1 .. 1_024);
+         Last   : Stream_Element_Offset;
+      begin
+         Set_Socket_Option
+           (Client, Socket_Level,
+            (Name => Receive_Timeout, Timeout => Hold_Limit));
+         loop
+            Receive_Socket (Client, Buffer, Last);
+            if Last < Buffer'First then
+               State.Record_Hang_Up;
+               return;
+            end if;
+         end loop;
+      end Await_Hang_Up;
+
+      procedure Send_Text (Client : Socket_Type; Text : String) is
+         Buffer : Stream_Element_Array
+           (1 .. Stream_Element_Offset (Text'Length));
+         First  : Stream_Element_Offset := Buffer'First;
+         Last   : Stream_Element_Offset;
+      begin
+         for I in Text'Range loop
+            Buffer (Stream_Element_Offset (I - Text'First + 1))
+              := Stream_Element (Character'Pos (Text (I)));
+         end loop;
+         while First <= Buffer'Last loop
+            Send_Socket (Client, Buffer (First .. Buffer'Last), Last);
+            First := Last + 1;
+         end loop;
+      end Send_Text;
+
    begin
       loop
          exit when Control.Stopping;
@@ -242,23 +378,25 @@ package body Loopback is
                   end loop Reading;
                end;
                State.Record_Request (To_String (Data));
-               declare
-                  Reply  : constant String := State.Reply_Text;
-                  Buffer : Stream_Element_Array
-                    (1 .. Stream_Element_Offset (Reply'Length));
-                  First  : Stream_Element_Offset := Buffer'First;
-                  Last   : Stream_Element_Offset;
-               begin
-                  for I in Reply'Range loop
-                     Buffer (Stream_Element_Offset (I - Reply'First + 1))
-                       := Stream_Element (Character'Pos (Reply (I)));
-                  end loop;
-                  while First <= Buffer'Last loop
-                     Send_Socket (Client, Buffer (First .. Buffer'Last),
-                                  Last);
-                     First := Last + 1;
-                  end loop;
-               end;
+               if State.Is_Scripted then
+                  declare
+                     Status  : Natural;
+                     Content : Unbounded_String;
+                  begin
+                     State.Take_Scripted (Status, Content);
+                     if Status = Silence then
+                        Await_Hang_Up (Client);
+                     elsif Status /= Hang_Up then
+                        Send_Text
+                          (Client, Scripted_Text (Status, To_String (Content)));
+                     end if;
+                  end;
+               else
+                  Send_Text (Client, State.Reply_Text);
+                  if State.Holds then
+                     Await_Hang_Up (Client);
+                  end if;
+               end if;
                Close_Socket (Client);
                exception
                   when Socket_Error =>
@@ -322,6 +460,27 @@ package body Loopback is
       New_Acceptor := new Acceptor_Task;
    end Start;
 
+   procedure Start_Raw
+     (Reply : String;
+      Port  : out Positive) is
+   begin
+      Start ("", Port);
+      --  Nothing has connected yet: only the caller learns the port.
+      State.Configure_Raw (Reply);
+   end Start_Raw;
+
+   procedure Start_Script (Port : out Positive) is
+   begin
+      Start ("", Port);
+      --  Nothing has connected yet: only the caller learns the port.
+      State.Configure_Script;
+   end Start_Script;
+
+   procedure Add_Reply (Status : Natural; Content : String := "") is
+   begin
+      State.Add_Scripted (Status, Content);
+   end Add_Reply;
+
    procedure Stop is
       use GNAT.Sockets;
    begin
@@ -337,6 +496,11 @@ package body Loopback is
          Have_Listener := False;
       end if;
    end Stop;
+
+   function Hang_Ups return Natural is
+   begin
+      return State.Hang_Up_Count;
+   end Hang_Ups;
 
    function Request_Count return Natural is
    begin

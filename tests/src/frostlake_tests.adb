@@ -1,8 +1,10 @@
 --  The driver's test suite.  The unit half runs with no server and no
 --  JVM — the wire pieces directly, the whole driver against a loopback
 --  HTTP server.  The integration half boots a real DatabaseHttpServer
---  from FROSTLAKE_CLASSPATH and skips itself when that is unset.
+--  from FROSTLAKE_CLASSPATH and skips itself when that is unset.  Last,
+--  the engine's testkit corpus is replayed when FL_CORPUS names it.
 
+with Ada.Calendar;
 with Ada.Command_Line;
 with Ada.Environment_Variables;
 with Ada.Exceptions;
@@ -12,6 +14,7 @@ with Ada.Strings.Unbounded;
 with GNAT.OS_Lib;
 with GNAT.Sockets;
 
+with Corpus_Tests;
 with Frostlake.Http;
 with Frostlake.Sql;
 with Frostlake.Wire;
@@ -234,6 +237,77 @@ procedure Frostlake_Tests is
              "REFUSE is not USE");
    end Test_Selects_Session_State;
 
+   --  What a fresh session would not have: a moved scope, a setting, a
+   --  variable, or a temporary object — and what leaves the session alone.
+   procedure Test_Touches_Session is
+      procedure Touches (Statement : String) is
+      begin
+         Check (Sql.Touches_Session (Statement),
+                Statement & " touches the session");
+      end Touches;
+
+      procedure Leaves (Statement : String) is
+      begin
+         Check (not Sql.Touches_Session (Statement),
+                Statement & " leaves the session alone");
+      end Leaves;
+   begin
+      Touches ("USE SCHEMA other");
+      Touches ("set v = 1");
+      Touches ("UNSET v");
+      Touches ("ALTER SESSION SET TIMEZONE = 'UTC'");
+      Touches ("CREATE DATABASE d");
+      Touches ("CREATE OR REPLACE SCHEMA s");
+      Touches ("DROP DATABASE IF EXISTS d");
+      Touches ("CREATE TEMPORARY TABLE t (a INT)");
+      Touches ("create temp table t (a int)");
+      Touches ("CREATE OR REPLACE LOCAL TEMPORARY TABLE t (a INT)");
+      Touches ("CREATE VOLATILE TABLE t (a INT)");
+      Touches ("/* note */ -- more" & LF & " USE WAREHOUSE w");
+      --  A USE riding behind another statement still counts.
+      Touches ("SELECT 1; USE SCHEMA other");
+
+      Leaves ("SELECT 1");
+      Leaves ("CREATE TABLE t (a INT)");
+      Leaves ("CREATE TRANSIENT TABLE t (a INT)");
+      Leaves ("CREATE TABLE temporary (a INT)");
+      Leaves ("DROP TABLE temp");
+      Leaves ("ALTER TABLE t ADD COLUMN c INT");
+      Leaves ("INSERT INTO t VALUES (1)");
+      --  The same words inside a literal, a comment or a $$ body do not.
+      Leaves ("SELECT 'x; USE SCHEMA other'");
+      Leaves ("SELECT 1 -- ; SET v = 1");
+      Leaves ("SELECT $$ ; USE SCHEMA other $$");
+   end Test_Touches_Session;
+
+   procedure Test_Transaction_Effect is
+      use type Sql.Transaction_Change;
+
+      procedure Expect (Statement : String; Want : Sql.Transaction_Change)
+      is
+      begin
+         Check (Sql.Transaction_Effect (Statement) = Want,
+                Statement & " is "
+                & Sql.Transaction_Change'Image (Want));
+      end Expect;
+   begin
+      Expect ("BEGIN", Sql.Opens);
+      Expect ("begin transaction", Sql.Opens);
+      Expect ("BEGIN WORK", Sql.Opens);
+      Expect ("BEGIN NAME t1", Sql.Opens);
+      Expect ("START TRANSACTION", Sql.Opens);
+      Expect ("COMMIT", Sql.Closes);
+      Expect ("rollback work", Sql.Closes);
+      --  BEGIN followed by a statement opens a scripting block.
+      Expect ("BEGIN" & LF & "  SELECT 1", Sql.No_Change);
+      Expect ("START TASK t", Sql.No_Change);
+      Expect ("SELECT 1", Sql.No_Change);
+      Expect ("", Sql.No_Change);
+      --  A request is what its last such statement leaves it as.
+      Expect ("BEGIN; INSERT INTO t VALUES (1); COMMIT", Sql.Closes);
+      Expect ("BEGIN; INSERT INTO t VALUES (1)", Sql.Opens);
+   end Test_Transaction_Effect;
+
    ---------------------------------------------------------------
    --  Wire protocol
    ---------------------------------------------------------------
@@ -365,6 +439,28 @@ procedure Frostlake_Tests is
       Check (As_Date (Value (Set, 1, "D")) = Date_Value'(2026, 1, 2),
              "date cell value");
    end Test_Parse_Shuffled_Response;
+
+   procedure Test_Parse_New_Session is
+      Fresh : constant Wire.Response := Wire.Parse_Response
+        ("{""success"":true,""sessionId"":""s-1"",""newSession"":true,"
+         & """resultSets"":[]}");
+      Kept : constant Wire.Response := Wire.Parse_Response
+        ("{""success"":true,""sessionId"":""s-1"",""newSession"":false,"
+         & """resultSets"":[]}");
+      Silent : constant Wire.Response := Wire.Parse_Response
+        ("{""success"":true,""sessionId"":""s-1"",""resultSets"":[]}");
+   begin
+      Check (Fresh.Has_New_Session and then Fresh.New_Session,
+             "the server said it started a fresh session");
+      Check (Kept.Has_New_Session and then not Kept.New_Session,
+             "the server said it reused the session");
+      --  An engine from before the field says nothing, which has to stay
+      --  distinguishable from one that said False: only the second is a
+      --  promise that the session was kept.
+      Check (not Silent.Has_New_Session,
+             "an absent field is not a False one");
+      Check (not Silent.New_Session, "and reads as False by default");
+   end Test_Parse_New_Session;
 
    procedure Test_Parse_Error_Response is
       Parsed : constant Wire.Response := Wire.Parse_Response
@@ -799,6 +895,136 @@ procedure Frostlake_Tests is
       Loopback.Stop;
    end Test_Loopback_No_Length;
 
+   --  A reply whose status line cannot be read is refused, and the socket
+   --  that carried it goes too: GNAT.Sockets never closes one by itself.
+   --  The server holds every connection open after answering, so it sees a
+   --  hang-up only when the client closes its end.
+   procedure Test_Loopback_Malformed_Status is
+      CRLF : constant String := Character'Val (13) & Character'Val (10);
+
+      procedure Expect_Released (Status_Line : String) is
+         Calls : constant := 3;
+         Port  : Positive;
+      begin
+         Loopback.Start_Raw (Status_Line & CRLF & CRLF, Port);
+         for Call in 1 .. Calls loop
+            begin
+               declare
+                  Conn : Connection := Connect ("frostlake://127.0.0.1:"
+                                                & Img (Port));
+               begin
+                  Conn.Close;
+                  Record_Failure (Status_Line & ": accepted");
+               end;
+            exception
+               when E : Connection_Error =>
+                  Check_Equal
+                    (Ada.Exceptions.Exception_Message (E),
+                     "unintelligible response from 127.0.0.1:" & Img (Port),
+                     Status_Line & ": refusal message");
+            end;
+         end loop;
+         for Attempt in 1 .. 150 loop
+            exit when Loopback.Hang_Ups = Calls;
+            delay 0.02;
+         end loop;
+         Check_Equal (Long_Long_Integer (Loopback.Hang_Ups), Calls,
+                      Status_Line & ": sockets the client closed");
+         Loopback.Stop;
+      end Expect_Released;
+
+   begin
+      Expect_Released ("garbage");               --  no status at all
+      Expect_Released ("HTTP/1.1 two hundred");  --  no digits in it
+   end Test_Loopback_Malformed_Status;
+
+   --  Serves Head as a reply's whole header block, and expects the driver
+   --  to refuse it as unreadable, naming the endpoint, and to let go of the
+   --  socket that carried it.
+   procedure Expect_Unintelligible (Label : String; Head : String) is
+      CRLF : constant String := Character'Val (13) & Character'Val (10);
+      Port : Positive;
+   begin
+      Loopback.Start_Raw (Head & CRLF & CRLF, Port);
+      begin
+         declare
+            Conn : Connection := Connect ("frostlake://127.0.0.1:"
+                                          & Img (Port));
+         begin
+            Conn.Close;
+            Record_Failure (Label & ": accepted");
+         end;
+      exception
+         when E : Connection_Error =>
+            Check_Equal
+              (Ada.Exceptions.Exception_Message (E),
+               "unintelligible response from 127.0.0.1:" & Img (Port),
+               Label & ": refusal message");
+         when E : others =>
+            Record_Failure
+              (Label & ": wrong exception: "
+               & Ada.Exceptions.Exception_Information (E));
+      end;
+      for Attempt in 1 .. 150 loop
+         exit when Loopback.Hang_Ups = 1;
+         delay 0.02;
+      end loop;
+      Check_Equal (Long_Long_Integer (Loopback.Hang_Ups), 1,
+                   Label & ": socket the client closed");
+      Loopback.Stop;
+   end Expect_Unintelligible;
+
+   --  A number longer than its field can be is as unreadable as a missing
+   --  one: the same refusal, never an overflow into an exception the driver
+   --  does not document, and the socket still goes with it.
+   procedure Test_Loopback_Overlong_Numbers is
+      CRLF : constant String := Character'Val (13) & Character'Val (10);
+      Past_Natural : constant String :=
+        Ada.Strings.Fixed.Trim
+          (Long_Long_Integer'Image (Long_Long_Integer (Natural'Last) + 1),
+           Ada.Strings.Left);
+   begin
+      Expect_Unintelligible ("four-digit status", "HTTP/1.1 2000 OK");
+      Expect_Unintelligible
+        ("status past Natural", "HTTP/1.1 99999999999 OK");
+      Expect_Unintelligible
+        ("Content-Length past Natural",
+         "HTTP/1.1 200 OK" & CRLF & "Content-Length: " & Past_Natural);
+   end Test_Loopback_Overlong_Numbers;
+
+   --  A Content-Length is digits with nothing but whitespace around them.
+   --  Anything else is refused like an overlong one, where it was once
+   --  ignored and the body read to the end of the stream; zeros in front
+   --  of the digits still make a length.
+   procedure Test_Loopback_Non_Digit_Length is
+      CRLF : constant String := Character'Val (13) & Character'Val (10);
+      Port : Positive;
+   begin
+      Expect_Unintelligible
+        ("Content-Length 12x",
+         "HTTP/1.1 200 OK" & CRLF & "Content-Length: 12x");
+      Expect_Unintelligible
+        ("Content-Length 1 2",
+         "HTTP/1.1 200 OK" & CRLF & "Content-Length: 1 2");
+      Expect_Unintelligible
+        ("empty Content-Length",
+         "HTTP/1.1 200 OK" & CRLF & "Content-Length:");
+      --  Read to the end of the stream, this body would be "okay".
+      Loopback.Start_Raw
+        ("HTTP/1.1 200 OK" & CRLF
+         & "Content-Length: " & Character'Val (9) & "0002 " & CRLF & CRLF
+         & "okay", Port);
+      declare
+         Reply : constant Http.Reply := Http.Get
+           ("127.0.0.1", Port, "/api/health",
+            Open_Timeout => 1.0, Read_Timeout => 5.0);
+      begin
+         Check_Equal (Ada.Strings.Unbounded.To_String (Reply.Content), "ok",
+                      "zero-padded length read as a length");
+      end;
+      Loopback.Stop;
+   end Test_Loopback_Non_Digit_Length;
+
    procedure Test_Refused_Connection is
       Port : Positive;
    begin
@@ -819,6 +1045,687 @@ procedure Frostlake_Tests is
                    "refused connection message");
       end;
    end Test_Refused_Connection;
+
+   --  A host name the resolver cannot place is as unreachable as a closed
+   --  port, and the refusal names the endpoint.  The .invalid domain is
+   --  reserved never to resolve.
+   procedure Test_Unresolvable_Host is
+   begin
+      declare
+         Conn : Connection :=
+           Connect ("frostlake://nonexistent.invalid:18099");
+      begin
+         Conn.Close;
+         Record_Failure ("unresolvable host accepted");
+      end;
+   exception
+      when E : Connection_Error =>
+         Check (Contains (Ada.Exceptions.Exception_Message (E),
+                          "cannot reach nonexistent.invalid:18099"),
+                "unresolvable host message: "
+                & Ada.Exceptions.Exception_Message (E));
+   end Test_Unresolvable_Host;
+
+   ---------------------------------------------------------------
+   --  Session lifetime, against a scripted server: requireSession
+   --  once the engine is known to honour it, recovery from a session
+   --  the engine no longer holds, and the session released on close
+   ---------------------------------------------------------------
+
+   Health : constant String := "{""status"":""healthy"",""activeSessions"":0}";
+
+   --  Answers from an engine that reports newSession (0.1.0 and later).
+   S1_New   : constant String :=
+     "{""success"":true,""sessionId"":""s1"",""newSession"":true,"
+     & """resultSets"":[]}";
+   S1       : constant String :=
+     "{""success"":true,""sessionId"":""s1"",""newSession"":false,"
+     & """resultSets"":[]}";
+   S2_New   : constant String :=
+     "{""success"":true,""sessionId"":""s2"",""newSession"":true,"
+     & """resultSets"":[]}";
+   S2       : constant String :=
+     "{""success"":true,""sessionId"":""s2"",""newSession"":false,"
+     & """resultSets"":[]}";
+   S2_Seven : constant String :=
+     "{""success"":true,""sessionId"":""s2"",""newSession"":false,"
+     & """resultSets"":[{""columns"":[{""name"":""N"",""dataType"":"
+     & """NUMBER"",""precision"":38,""scale"":0}],""rows"":[[7]]}]}";
+   S3_New   : constant String :=
+     "{""success"":true,""sessionId"":""s3"",""newSession"":true,"
+     & """resultSets"":[]}";
+   S3       : constant String :=
+     "{""success"":true,""sessionId"":""s3"",""newSession"":false,"
+     & """resultSets"":[]}";
+
+   --  The 404 a request that requires its session gets once the engine no
+   --  longer holds it: nothing ran.
+   Gone_S1 : constant String :=
+     "{""success"":false,""errorMessage"":""Session 's1' does not exist or"
+     & " has expired."",""sessionId"":null,""newSession"":false,"
+     & """resultSets"":[]}";
+   Gone_S2 : constant String :=
+     "{""success"":false,""errorMessage"":""Session 's2' does not exist or"
+     & " has expired."",""sessionId"":null,""newSession"":false,"
+     & """resultSets"":[]}";
+
+   --  What DELETE /api/sessions/{id} answers for a session the engine held.
+   Released : constant String :=
+     "{""success"":true,""sessionId"":null,""newSession"":false,"
+     & """resultSets"":[]}";
+
+   --  An answer from an engine that predates newSession (0.0.7).
+   Legacy : constant String :=
+     "{""success"":true,""sessionId"":""s1"",""resultSets"":[]}";
+
+   Use_App : constant String := "USE DATABASE \""APP\""";
+
+   function App_Dsn (Port : Positive; Query : String := "") return String is
+     ("frostlake://127.0.0.1:" & Img (Port) & "/APP" & Query);
+
+   function Bare_Dsn (Port : Positive; Query : String := "") return String is
+     ("frostlake://127.0.0.1:" & Img (Port) & Query);
+
+   procedure Expect_Session_Lost
+     (Conn   : in out Connection;
+      Sql    : String;
+      Reason : String;
+      Label  : String) is
+   begin
+      Conn.Execute (Sql);
+      Record_Failure (Label & ": no Session_Lost_Error");
+   exception
+      when E : Session_Lost_Error =>
+         Check (Contains (Ada.Exceptions.Exception_Message (E), Reason),
+                Label & ": " & Ada.Exceptions.Exception_Message (E));
+      when E : others =>
+         Record_Failure
+           (Label & ": wrong exception: "
+            & Ada.Exceptions.Exception_Information (E));
+   end Expect_Session_Lost;
+
+   procedure Test_Session_Flag_Waits_For_The_Engine is
+      Port : Positive;
+   begin
+      Loopback.Start_Script (Port);
+      Loopback.Add_Reply (200, Health);
+      Loopback.Add_Reply (200, S1_New);    --  USE, which starts the session
+      Loopback.Add_Reply (200, S1);        --  SELECT 1
+      Loopback.Add_Reply (200, Released);  --  DELETE, on close
+      declare
+         Conn : Connection := Connect (App_Dsn (Port));
+      begin
+         Conn.Execute ("SELECT 1");
+         Conn.Close;
+         Conn.Close;
+      end;
+      Check_Equal (Long_Long_Integer (Loopback.Request_Count), 4,
+                   "one DELETE, however often closed");
+      --  Nothing is known before the first answer, so the request that
+      --  starts the session carries neither an id nor the flag.
+      Check (Contains (Loopback.Request_Text (2), Use_App),
+             "the scope first");
+      Check (not Contains (Loopback.Request_Text (2), "sessionId"),
+             "no id before the first answer");
+      Check (not Contains (Loopback.Request_Text (2), "requireSession"),
+             "no flag before the first answer");
+      --  That answer carried newSession, so every request naming the
+      --  session requires it from then on.
+      Check (Contains (Loopback.Request_Text (3),
+                       """sessionId"":""s1"",""requireSession"":true"),
+             "the session required once the engine said it keeps them");
+      Check (Contains (Loopback.Request_Text (4),
+                       "DELETE /api/sessions/s1 HTTP/1.1"),
+             "close released the session");
+      Loopback.Stop;
+   end Test_Session_Flag_Waits_For_The_Engine;
+
+   procedure Test_Older_Engine_Gets_No_Session_Flag is
+      Port : Positive;
+   begin
+      --  Engines before 0.1.0 answer no newSession and know neither
+      --  requireSession nor DELETE /api/sessions: their parser may refuse a
+      --  field it does not know.
+      Loopback.Start_Script (Port);
+      Loopback.Add_Reply (200, Health);
+      Loopback.Add_Reply (200, Legacy);  --  USE
+      Loopback.Add_Reply (200, Legacy);  --  SELECT 1
+      declare
+         Conn : Connection := Connect (App_Dsn (Port));
+      begin
+         Conn.Execute ("SELECT 1");
+         Conn.Close;
+      end;
+      Check_Equal (Long_Long_Integer (Loopback.Request_Count), 3,
+                   "no DELETE to an older engine");
+      Check (Contains (Loopback.Request_Text (3), """sessionId"":""s1"""),
+             "the session named");
+      Check (not Contains (Loopback.Request_Text (3), "requireSession"),
+             "an older engine is never sent requireSession");
+      Loopback.Stop;
+   end Test_Older_Engine_Gets_No_Session_Flag;
+
+   procedure Test_Lost_Session_Is_Replaced_Once is
+      Port : Positive;
+   begin
+      Loopback.Start_Script (Port);
+      Loopback.Add_Reply (200, Health);
+      Loopback.Add_Reply (200, S1_New);    --  USE
+      Loopback.Add_Reply (200, S1);        --  CREATE TABLE, which is no context
+      Loopback.Add_Reply (404, Gone_S1);   --  SELECT 7: the session is gone
+      Loopback.Add_Reply (200, S2_New);    --  USE, in a fresh session
+      Loopback.Add_Reply (200, S2_Seven);  --  SELECT 7, once more
+      Loopback.Add_Reply (200, Released);
+      declare
+         Conn : Connection := Connect (App_Dsn (Port));
+      begin
+         Conn.Execute ("CREATE TABLE t (a INT)");
+         declare
+            R : constant Result := Conn.Execute ("SELECT 7 AS N");
+         begin
+            Check_Equal (As_Integer (Value (R, 1, "N")), 7,
+                         "the statement sent once more answered");
+         end;
+         Check_Equal (Conn.Session, "s2", "the fresh session is the one held");
+         Conn.Close;
+      end;
+      Check_Equal (Long_Long_Integer (Loopback.Request_Count), 7,
+                   "requests of a recovered statement");
+      --  The scope went onto a fresh session, named by no id, and the
+      --  statement followed it there.
+      Check (Contains (Loopback.Request_Text (5), Use_App)
+               and then not Contains (Loopback.Request_Text (5), "sessionId"),
+             "the scope onto a fresh session");
+      Check (Contains (Loopback.Request_Text (6), "SELECT 7 AS N")
+               and then Contains
+                 (Loopback.Request_Text (6),
+                  """sessionId"":""s2"",""requireSession"":true"),
+             "the statement once more, in the fresh session");
+      Check (Contains (Loopback.Request_Text (7), "DELETE /api/sessions/s2 "),
+             "the fresh session released on close");
+      Loopback.Stop;
+   end Test_Lost_Session_Is_Replaced_Once;
+
+   procedure Test_Second_Loss_Raises is
+      Port : Positive;
+   begin
+      Loopback.Start_Script (Port);
+      Loopback.Add_Reply (200, Health);
+      Loopback.Add_Reply (200, S1_New);    --  USE
+      Loopback.Add_Reply (404, Gone_S1);   --  SELECT 1
+      Loopback.Add_Reply (200, S2_New);    --  USE, in a fresh session
+      Loopback.Add_Reply (404, Gone_S2);   --  SELECT 1, refused again
+      Loopback.Add_Reply (200, S3_New);    --  the next statement starts over
+      Loopback.Add_Reply (200, S3);        --  SELECT 2
+      Loopback.Add_Reply (200, Released);
+      declare
+         Conn : Connection := Connect (App_Dsn (Port));
+      begin
+         Expect_Session_Lost (Conn, "SELECT 1", "just started",
+                              "a second refusal");
+         Check (not Conn.Is_Closed, "the connection carries on");
+         Conn.Execute ("SELECT 2");
+         Conn.Close;
+      end;
+      Check_Equal (Long_Long_Integer (Loopback.Request_Count), 8,
+                   "requests of a twice-refused statement");
+      Check (Contains (Loopback.Request_Text (6), Use_App)
+               and then not Contains (Loopback.Request_Text (6), "sessionId"),
+             "the next statement starts a fresh session on the scope");
+      Loopback.Stop;
+   end Test_Second_Loss_Raises;
+
+   procedure Test_Lost_Transaction_Raises is
+      Port : Positive;
+   begin
+      Loopback.Start_Script (Port);
+      Loopback.Add_Reply (200, Health);
+      Loopback.Add_Reply (200, S1_New);    --  USE
+      Loopback.Add_Reply (200, S1);        --  BEGIN
+      Loopback.Add_Reply (404, Gone_S1);   --  INSERT: the session is gone
+      Loopback.Add_Reply (200, S2_New);    --  the next statement starts over
+      Loopback.Add_Reply (200, S2);        --  SELECT 1
+      Loopback.Add_Reply (200, Released);
+      declare
+         Conn : Connection := Connect (App_Dsn (Port));
+      begin
+         Conn.Begin_Transaction;
+         Check (Conn.In_Transaction, "BEGIN opened a transaction");
+         Expect_Session_Lost (Conn, "INSERT INTO t VALUES (1)", "transaction",
+                              "a lost transaction");
+         Check (not Conn.In_Transaction, "the transaction went with it");
+         Conn.Execute ("SELECT 1");
+         Conn.Close;
+      end;
+      Check_Equal (Long_Long_Integer (Loopback.Request_Count), 7,
+                   "requests around a lost transaction");
+      --  The INSERT was not sent again, and the next statement started
+      --  over on the DSN's scope with autocommit back on.
+      Check (Contains (Loopback.Request_Text (4), "INSERT INTO t VALUES (1)"),
+             "the INSERT sent once");
+      Check (Contains (Loopback.Request_Text (5), Use_App)
+               and then not Contains (Loopback.Request_Text (5), "sessionId")
+               and then Contains (Loopback.Request_Text (5),
+                                  """autoCommit"":true"),
+             "a fresh session on the scope, autocommit back on");
+      Check (Contains (Loopback.Request_Text (6), "SELECT 1")
+               and then Contains (Loopback.Request_Text (6),
+                                  """autoCommit"":true"),
+             "the next statement autocommits");
+      Loopback.Stop;
+   end Test_Lost_Transaction_Raises;
+
+   procedure Test_Statement_Transaction_Is_Tracked is
+      Port : Positive;
+   begin
+      Loopback.Start_Script (Port);
+      Loopback.Add_Reply (200, Health);
+      Loopback.Add_Reply (200, S1_New);    --  USE
+      Loopback.Add_Reply (200, S1);        --  BEGIN TRANSACTION
+      Loopback.Add_Reply (200, S1);        --  COMMIT
+      Loopback.Add_Reply (200, S1);        --  START TRANSACTION
+      Loopback.Add_Reply (404, Gone_S1);   --  INSERT: the session is gone
+      declare
+         Conn : Connection := Connect (App_Dsn (Port));
+      begin
+         Conn.Execute ("BEGIN TRANSACTION");
+         Check (Conn.In_Transaction, "BEGIN TRANSACTION opens one");
+         Conn.Execute ("COMMIT");
+         Check (not Conn.In_Transaction, "COMMIT ends it");
+         Conn.Execute ("START TRANSACTION");
+         Check (Conn.In_Transaction, "START TRANSACTION opens one");
+         Expect_Session_Lost (Conn, "INSERT INTO t VALUES (1)", "transaction",
+                              "a lost statement transaction");
+         Check (not Conn.In_Transaction, "and it went with the session");
+         --  The session is gone, so closing has nothing to release.
+         Conn.Close;
+      end;
+      Check_Equal (Long_Long_Integer (Loopback.Request_Count), 6,
+                   "nothing released for a session already gone");
+      Loopback.Stop;
+   end Test_Statement_Transaction_Is_Tracked;
+
+   procedure Test_Lost_Context_Raises is
+      --  Each of these leaves something behind that a fresh session would
+      --  not have, so re-running the next statement in one would run it
+      --  somewhere else.
+      procedure After (Context : String) is
+         Port : Positive;
+      begin
+         Loopback.Start_Script (Port);
+         Loopback.Add_Reply (200, Health);
+         Loopback.Add_Reply (200, S1_New);    --  USE
+         Loopback.Add_Reply (200, S1);        --  the context
+         Loopback.Add_Reply (404, Gone_S1);   --  SELECT: the session is gone
+         Loopback.Add_Reply (200, S2_New);    --  the next statement starts over
+         Loopback.Add_Reply (200, S2);        --  SELECT 1
+         Loopback.Add_Reply (200, Released);
+         declare
+            Conn : Connection := Connect (App_Dsn (Port));
+         begin
+            Conn.Execute (Context);
+            Expect_Session_Lost (Conn, "SELECT * FROM t", "context",
+                                 "lost after " & Context);
+            Conn.Execute ("SELECT 1");
+            Conn.Close;
+         end;
+         Check_Equal (Long_Long_Integer (Loopback.Request_Count), 7,
+                      "requests after " & Context);
+         Check (Contains (Loopback.Request_Text (4), "SELECT * FROM t"),
+                "the statement sent once after " & Context);
+         Check (Contains (Loopback.Request_Text (5), Use_App)
+                  and then not Contains (Loopback.Request_Text (5),
+                                         "sessionId"),
+                "a fresh session on the scope after " & Context);
+         Loopback.Stop;
+      end After;
+   begin
+      After ("USE SCHEMA OTHER");
+      After ("SET v = 1");
+      After ("ALTER SESSION SET TIMEZONE = 'UTC'");
+      After ("CREATE TEMPORARY TABLE scratch (a INT)");
+   end Test_Lost_Context_Raises;
+
+   procedure Test_Replaced_Session_Gets_Its_Scope_Back is
+      Port : Positive;
+   begin
+      --  An engine that ran a request in a fresh session in place of the
+      --  one it named says so with newSession: true; what the old one held
+      --  is gone.
+      Loopback.Start_Script (Port);
+      Loopback.Add_Reply (200, Health);
+      Loopback.Add_Reply (200, S1_New);    --  USE
+      Loopback.Add_Reply (200, S1_New);    --  SELECT 1, in a fresh session
+      Loopback.Add_Reply (200, S1);        --  USE, again
+      Loopback.Add_Reply (200, S1);        --  SELECT 2
+      Loopback.Add_Reply (200, Released);
+      declare
+         Conn : Connection := Connect (App_Dsn (Port));
+      begin
+         Conn.Execute ("SELECT 1");
+         Conn.Execute ("SELECT 2");
+         Conn.Close;
+      end;
+      Check_Equal (Long_Long_Integer (Loopback.Request_Count), 6,
+                   "requests around a replaced session");
+      Check (Contains (Loopback.Request_Text (4), Use_App),
+             "the scope back on first");
+      Check (Contains (Loopback.Request_Text (5), "SELECT 2"),
+             "then the next statement");
+      Loopback.Stop;
+   end Test_Replaced_Session_Gets_Its_Scope_Back;
+
+   procedure Test_Idle_Rescope_Is_For_Older_Engines is
+      Port : Positive;
+   begin
+      --  An engine that answers newSession refuses a lapsed session instead
+      --  of rebuilding it, and the refusal is recovered from where it lands:
+      --  no USE goes ahead of a statement on a hunch, however long the
+      --  connection idled.
+      Loopback.Start_Script (Port);
+      Loopback.Add_Reply (200, Health);
+      Loopback.Add_Reply (200, S1_New);    --  USE
+      Loopback.Add_Reply (200, S1);        --  SELECT 1
+      Loopback.Add_Reply (200, S1);        --  SELECT 2
+      Loopback.Add_Reply (200, Released);
+      declare
+         Conn : Connection :=
+           Connect (App_Dsn (Port, "?session_idle_limit=0.01"));
+      begin
+         Conn.Execute ("SELECT 1");
+         delay 0.05;
+         Conn.Execute ("SELECT 2");
+         Conn.Close;
+      end;
+      Check_Equal (Long_Long_Integer (Loopback.Request_Count), 5,
+                   "no USE on a hunch to an engine that keeps sessions");
+      Check (Contains (Loopback.Request_Text (4), "SELECT 2"),
+             "SELECT 2 straight after SELECT 1");
+      Loopback.Stop;
+
+      --  An older engine rebuilds a lapsed session under the same id
+      --  without a word, so past the limit the scope goes back on first.
+      Loopback.Start_Script (Port);
+      Loopback.Add_Reply (200, Health);
+      for Reply in 1 .. 6 loop
+         Loopback.Add_Reply (200, Legacy);
+      end loop;
+      declare
+         Conn : Connection :=
+           Connect (App_Dsn (Port, "?session_idle_limit=0.01"));
+      begin
+         Conn.Execute ("SELECT 1");
+         delay 0.05;
+         Conn.Execute ("SELECT 2");
+         Conn.Close;
+      end;
+      declare
+         Last : constant Natural := Loopback.Request_Count;
+      begin
+         Check (Last >= 5
+                  and then Contains (Loopback.Request_Text (Last), "SELECT 2")
+                  and then Contains (Loopback.Request_Text (Last - 1),
+                                     Use_App),
+                "an older engine's idle session gets the scope back");
+      end;
+      Loopback.Stop;
+   end Test_Idle_Rescope_Is_For_Older_Engines;
+
+   procedure Test_Scope_Exit_Releases_The_Session is
+      Port : Positive;
+   begin
+      Loopback.Start_Script (Port);
+      Loopback.Add_Reply (200, Health);
+      Loopback.Add_Reply (200, S1_New);    --  SELECT 1
+      Loopback.Add_Reply (200, Released);  --  DELETE, as the scope ends
+      declare
+         Conn : Connection := Connect (Bare_Dsn (Port));
+      begin
+         Conn.Execute ("SELECT 1");
+      end;
+      Check_Equal (Long_Long_Integer (Loopback.Request_Count), 3,
+                   "a connection going out of scope releases its session");
+      Check (Contains (Loopback.Request_Text (3), "DELETE /api/sessions/s1 "),
+             "the DELETE names the session");
+      Loopback.Stop;
+   end Test_Scope_Exit_Releases_The_Session;
+
+   procedure Test_Refused_Scope_Releases_The_Session is
+      Port : Positive;
+   begin
+      --  The engine refused the USE, but in a session it started for it.
+      Loopback.Start_Script (Port);
+      Loopback.Add_Reply (200, Health);
+      Loopback.Add_Reply
+        (200,
+         "{""success"":false,""errorMessage"":""Database 'APP' does not exist"
+         & " or not authorized."",""sessionId"":""s9"",""newSession"":true,"
+         & """resultSets"":[]}");
+      Loopback.Add_Reply (200, Released);
+      begin
+         declare
+            Conn : Connection := Connect (App_Dsn (Port));
+         begin
+            Conn.Close;
+            Record_Failure ("a refused scope connected");
+         end;
+      exception
+         when Query_Error =>
+            null;
+      end;
+      Check_Equal (Long_Long_Integer (Loopback.Request_Count), 3,
+                   "a refused connect still releases the session it started");
+      Check (Contains (Loopback.Request_Text (3), "DELETE /api/sessions/s9 "),
+             "the DELETE names that session");
+      Loopback.Stop;
+   end Test_Refused_Scope_Releases_The_Session;
+
+   procedure Test_Closing_Never_Raises is
+      use type Ada.Calendar.Time;
+
+      --  Whatever the DELETE meets, closing returns quietly, within its
+      --  bound: here the DSN's one-second read timeout, shorter than the
+      --  five seconds closing would otherwise allow itself.
+      procedure Against (Status : Natural; Content : String; Label : String)
+      is
+         Port    : Positive;
+         Started : Ada.Calendar.Time;
+      begin
+         Loopback.Start_Script (Port);
+         Loopback.Add_Reply (200, Health);
+         Loopback.Add_Reply (200, S1_New);    --  SELECT 1
+         Loopback.Add_Reply (Status, Content);
+         declare
+            Conn : Connection := Connect (Bare_Dsn (Port, "?read_timeout=1"));
+         begin
+            Conn.Execute ("SELECT 1");
+            Started := Ada.Calendar.Clock;
+            Conn.Close;
+            Check (Ada.Calendar.Clock - Started < 4.0,
+                   Label & ": closing returned within its bound");
+            Check (Conn.Is_Closed, Label & ": closed");
+         end;
+         Check_Equal (Long_Long_Integer (Loopback.Request_Count), 3,
+                      Label & ": the DELETE was sent");
+         Check (Contains (Loopback.Request_Text (3), "DELETE /api/sessions/s1 "),
+                Label & ": the DELETE names the session");
+         Loopback.Stop;
+      end Against;
+
+      Port : Positive;
+   begin
+      Against
+        (404,
+         "{""success"":false,""errorMessage"":""Session 's1' does not exist"
+         & " or has expired."",""sessionId"":null,""resultSets"":[]}",
+         "a 404");
+      Against (405, "", "a 405");
+      Against (Loopback.Hang_Up, "", "a hang-up");
+      Against (Loopback.Silence, "", "silence");
+
+      --  Nothing listening at all: the release cannot even connect.
+      Loopback.Start_Script (Port);
+      Loopback.Add_Reply (200, Health);
+      Loopback.Add_Reply (200, S1_New);
+      declare
+         Conn : Connection := Connect (Bare_Dsn (Port, "?read_timeout=1"));
+      begin
+         Conn.Execute ("SELECT 1");
+         Loopback.Stop;
+         Conn.Close;
+         Check (Conn.Is_Closed, "nothing listening: closed");
+      end;
+   end Test_Closing_Never_Raises;
+
+   ---------------------------------------------------------------
+   --  A failed Begin_Transaction, against a scripted server: BEGIN
+   --  goes out with autocommit off, but only a BEGIN that ran turns
+   --  the connection's autocommit off
+   ---------------------------------------------------------------
+
+   Begin_Refused : constant String :=
+     "{""success"":false,""errorMessage"":""BEGIN refused"","
+     & """sessionId"":""s1"",""newSession"":false,""resultSets"":[]}";
+
+   procedure Test_Failed_Begin_Keeps_Autocommit is
+      --  After a BEGIN that failed, the next statement still autocommits
+      --  instead of running in an implicit transaction that nobody opened
+      --  and that closing would roll back unseen.
+      procedure Against (Status : Natural; Content : String; Label : String)
+      is
+         Port : Positive;
+      begin
+         Loopback.Start_Script (Port);
+         Loopback.Add_Reply (200, Health);
+         Loopback.Add_Reply (200, S1_New);    --  SELECT 1
+         Loopback.Add_Reply (Status, Content); --  BEGIN
+         Loopback.Add_Reply (200, S1);        --  INSERT
+         Loopback.Add_Reply (200, Released);  --  DELETE, on close
+         declare
+            Conn : Connection := Connect (Bare_Dsn (Port));
+         begin
+            Conn.Execute ("SELECT 1");
+            begin
+               Conn.Begin_Transaction;
+               Record_Failure (Label & ": the BEGIN did not fail");
+            exception
+               when Query_Error | Connection_Error =>
+                  null;
+            end;
+            Check (not Conn.In_Transaction,
+                   Label & ": no transaction was opened");
+            Conn.Execute ("INSERT INTO t VALUES (1)");
+            Conn.Close;
+         end;
+         Check_Equal (Long_Long_Integer (Loopback.Request_Count), 5,
+                      Label & ": requests around a failed begin");
+         Check (Contains (Loopback.Request_Text (3), "BEGIN")
+                  and then Contains (Loopback.Request_Text (3),
+                                     """autoCommit"":false"),
+                Label & ": BEGIN still goes out with autocommit off");
+         Check (Contains (Loopback.Request_Text (4), "INSERT")
+                  and then Contains (Loopback.Request_Text (4),
+                                     """autoCommit"":true"),
+                Label & ": the statement after a failed begin autocommits");
+         Loopback.Stop;
+      end Against;
+   begin
+      Against (200, Begin_Refused, "a refused BEGIN");
+      Against (502, "<html>Bad Gateway</html>", "an unreadable answer");
+      Against (Loopback.Hang_Up, "", "a hang-up");
+   end Test_Failed_Begin_Keeps_Autocommit;
+
+   procedure Test_Begin_Behind_Refused_Use_Keeps_Autocommit is
+      --  An older engine's idle session gets the DSN's scope back before the
+      --  next statement, a BEGIN included; refused, that USE fails the begin
+      --  before any BEGIN is sent.
+      Refused_Use : constant String :=
+        "{""success"":false,""errorMessage"":""Database 'APP' does not"
+        & " exist or not authorized."",""sessionId"":null,"
+        & """resultSets"":[]}";
+      Port : Positive;
+   begin
+      Loopback.Start_Script (Port);
+      Loopback.Add_Reply (200, Health);
+      Loopback.Add_Reply (200, Legacy);        --  USE, on connect
+      Loopback.Add_Reply (500, Refused_Use);   --  USE, ahead of the BEGIN
+      Loopback.Add_Reply (200, Legacy);        --  USE, ahead of the INSERT
+      Loopback.Add_Reply (200, Legacy);        --  INSERT
+      declare
+         Conn : Connection :=
+           Connect (App_Dsn (Port, "?session_idle_limit=0.01"));
+      begin
+         delay 0.05;
+         begin
+            Conn.Begin_Transaction;
+            Record_Failure ("a refused USE did not fail the begin");
+         exception
+            when Query_Error =>
+               null;
+         end;
+         Check (not Conn.In_Transaction, "no transaction was opened");
+         delay 0.05;
+         Conn.Execute ("INSERT INTO t VALUES (1)");
+         Conn.Close;
+      end;
+      Check_Equal (Long_Long_Integer (Loopback.Request_Count), 5,
+                   "requests around a begin behind a refused USE");
+      for Index in 1 .. Loopback.Request_Count loop
+         Check (not Contains (Loopback.Request_Text (Index), "BEGIN"),
+                "no BEGIN went out, request" & Natural'Image (Index));
+      end loop;
+      for Index in 3 .. 5 loop
+         Check (Contains (Loopback.Request_Text (Index), """autoCommit"":true"),
+                "request" & Natural'Image (Index) & " autocommits");
+      end loop;
+      Check (Contains (Loopback.Request_Text (5), "INSERT"),
+             "the statement came last");
+      Loopback.Stop;
+   end Test_Begin_Behind_Refused_Use_Keeps_Autocommit;
+
+   procedure Test_Begin_Its_Fresh_Session_Refuses_Keeps_Autocommit is
+      --  The session was gone under the BEGIN, so the scope went onto a fresh
+      --  session and the BEGIN once more, still with autocommit off — and
+      --  that one was refused.
+      Port : Positive;
+   begin
+      Loopback.Start_Script (Port);
+      Loopback.Add_Reply (200, Health);
+      Loopback.Add_Reply (200, S1_New);    --  USE, on connect
+      Loopback.Add_Reply (404, Gone_S1);   --  BEGIN: the session is gone
+      Loopback.Add_Reply (200, S2_New);    --  USE, in a fresh session
+      Loopback.Add_Reply
+        (200,
+         "{""success"":false,""errorMessage"":""BEGIN refused"","
+         & """sessionId"":""s2"",""newSession"":false,""resultSets"":[]}");
+      Loopback.Add_Reply (200, S2);        --  INSERT
+      Loopback.Add_Reply (200, Released);  --  DELETE, on close
+      declare
+         Conn : Connection := Connect (App_Dsn (Port));
+      begin
+         begin
+            Conn.Begin_Transaction;
+            Record_Failure ("a refused BEGIN did not fail the begin");
+         exception
+            when Query_Error =>
+               null;
+         end;
+         Check (not Conn.In_Transaction, "no transaction was opened");
+         Conn.Execute ("INSERT INTO t VALUES (1)");
+         Conn.Close;
+      end;
+      Check_Equal (Long_Long_Integer (Loopback.Request_Count), 7,
+                   "requests around a BEGIN refused in a fresh session");
+      Check (Contains (Loopback.Request_Text (5), "BEGIN")
+               and then Contains (Loopback.Request_Text (5),
+                                  """autoCommit"":false"),
+             "the BEGIN went again with autocommit off");
+      Check (Contains (Loopback.Request_Text (6), "INSERT")
+               and then Contains (Loopback.Request_Text (6),
+                                  """autoCommit"":true"),
+             "the statement after the failed begin autocommits");
+      Loopback.Stop;
+   end Test_Begin_Its_Fresh_Session_Refuses_Keeps_Autocommit;
 
    ---------------------------------------------------------------
    --  Integration: a real DatabaseHttpServer
@@ -921,11 +1828,14 @@ begin
    Guarded ("format literal", Test_Format_Literal'Access);
    Guarded ("substitute", Test_Substitute'Access);
    Guarded ("selects session state", Test_Selects_Session_State'Access);
+   Guarded ("touches session", Test_Touches_Session'Access);
+   Guarded ("transaction effect", Test_Transaction_Effect'Access);
    Guarded ("escape json", Test_Escape_Json'Access);
    Guarded ("build request", Test_Build_Request'Access);
    Guarded ("parse success", Test_Parse_Success_Response'Access);
    Guarded ("parse column length", Test_Parse_Column_Length'Access);
    Guarded ("parse shuffled", Test_Parse_Shuffled_Response'Access);
+   Guarded ("parse new session", Test_Parse_New_Session'Access);
    Guarded ("parse error", Test_Parse_Error_Response'Access);
    Guarded ("parse garbage", Test_Parse_Garbage'Access);
    Guarded ("retype", Test_Retype'Access);
@@ -941,10 +1851,44 @@ begin
    Guarded ("loopback query error", Test_Loopback_Query_Error'Access);
    Guarded ("loopback unreadable", Test_Loopback_Unreadable'Access);
    Guarded ("loopback no length", Test_Loopback_No_Length'Access);
+   Guarded ("loopback malformed status",
+            Test_Loopback_Malformed_Status'Access);
+   Guarded ("loopback overlong numbers",
+            Test_Loopback_Overlong_Numbers'Access);
+   Guarded ("loopback non-digit length",
+            Test_Loopback_Non_Digit_Length'Access);
    Guarded ("refused connection", Test_Refused_Connection'Access);
+   Guarded ("unresolvable host", Test_Unresolvable_Host'Access);
+   Guarded ("session flag waits for the engine",
+            Test_Session_Flag_Waits_For_The_Engine'Access);
+   Guarded ("older engine gets no session flag",
+            Test_Older_Engine_Gets_No_Session_Flag'Access);
+   Guarded ("lost session is replaced once",
+            Test_Lost_Session_Is_Replaced_Once'Access);
+   Guarded ("second loss raises", Test_Second_Loss_Raises'Access);
+   Guarded ("lost transaction raises", Test_Lost_Transaction_Raises'Access);
+   Guarded ("statement transaction is tracked",
+            Test_Statement_Transaction_Is_Tracked'Access);
+   Guarded ("lost context raises", Test_Lost_Context_Raises'Access);
+   Guarded ("replaced session gets its scope back",
+            Test_Replaced_Session_Gets_Its_Scope_Back'Access);
+   Guarded ("idle rescope is for older engines",
+            Test_Idle_Rescope_Is_For_Older_Engines'Access);
+   Guarded ("scope exit releases the session",
+            Test_Scope_Exit_Releases_The_Session'Access);
+   Guarded ("refused scope releases the session",
+            Test_Refused_Scope_Releases_The_Session'Access);
+   Guarded ("closing never raises", Test_Closing_Never_Raises'Access);
+   Guarded ("failed begin keeps autocommit",
+            Test_Failed_Begin_Keeps_Autocommit'Access);
+   Guarded ("begin behind a refused USE keeps autocommit",
+            Test_Begin_Behind_Refused_Use_Keeps_Autocommit'Access);
+   Guarded ("begin its fresh session refuses keeps autocommit",
+            Test_Begin_Its_Fresh_Session_Refuses_Keeps_Autocommit'Access);
    Loopback.Stop;
 
    Run_Integration;
+   Corpus_Tests.Run;
 
    Note (Img (Passed) & " passed," & Natural'Image (Failed) & " failed,"
          & Natural'Image (Skipped) & " skipped");
