@@ -28,6 +28,7 @@ procedure Frostlake_Tests is
    use Test_Support;
 
    LF : constant Character := Character'Val (10);
+   CR : constant Character := Character'Val (13);
 
    function Contains (Haystack : String; Needle : String) return Boolean is
    begin
@@ -102,7 +103,7 @@ procedure Frostlake_Tests is
       Check_Equal (Sql.Format_Literal (To_Cell (False)), "FALSE",
                    "false literal");
       Check_Equal (Sql.Format_Literal (To_Cell (Long_Long_Integer'(-5))),
-                   "-5", "negative integer literal");
+                   "(-5)", "negative integer literal is parenthesised");
       Check_Equal (Sql.Format_Literal (To_Decimal ("12.34")), "12.34",
                    "decimal literal");
       Check_Equal
@@ -220,6 +221,59 @@ procedure Frostlake_Tests is
          "SELECT 1", "extra binds are not an error");
    end Test_Substitute;
 
+   --  A negative number is bound in parentheses: bare, 3-? would read
+   --  3--5, a line comment, and ?::VARCHAR would cast before it negates.
+   procedure Test_Substitute_Negative_Numbers is
+      Minus_Five : constant Bind_Array := [To_Cell (Long_Long_Integer'(-5))];
+      Zero       : Long_Float := 0.0;
+      pragma Warnings (Off, Zero);
+   begin
+      Check_Equal (Sql.Substitute ("SELECT 3-?", Minus_Five),
+                   "SELECT 3-(-5)", "negative integer after a minus");
+      Check_Equal (Sql.Substitute ("SELECT ?::VARCHAR", Minus_Five),
+                   "SELECT (-5)::VARCHAR", "negative integer before a cast");
+      Check_Equal
+        (Sql.Substitute ("SELECT 3-?", [To_Cell (Long_Long_Integer'First)]),
+         "SELECT 3-(-9223372036854775808)", "most negative integer");
+      Check_Equal
+        (Sql.Substitute
+           ("SELECT 3-?", [To_Decimal ("-123456789012345678901234567890")]),
+         "SELECT 3-(-123456789012345678901234567890)",
+         "negative integer beyond 64 bits");
+      Check_Equal (Sql.Substitute ("SELECT 3-?", [To_Decimal ("-2.5")]),
+                   "SELECT 3-(-2.5)", "negative decimal");
+      Check_Equal
+        (Sql.Substitute ("SELECT 3-?", [To_Cell (Long_Float'(-2.5))]),
+         "SELECT 3-(-2.50000000000000E+00)", "negative float");
+      --  Judged on the rendered text: -0.0 is not below zero, but it is
+      --  written with a minus all the same.
+      Check_Equal (Sql.Substitute ("SELECT 3-?", [To_Cell (-Zero)]),
+                   "SELECT 3-(-0.00000000000000E+00)", "negative zero float");
+      Check_Equal
+        (Sql.Substitute ("SELECT 3-?", [To_Cell (Long_Long_Integer'(5))]),
+         "SELECT 3-5", "a positive number stays bare");
+   end Test_Substitute_Negative_Numbers;
+
+   --  The text is read as the engine's lexer reads it: a name is read
+   --  whole, so the $$ inside a$$b opens no body, and a line comment ends
+   --  at a carriage return as well as at a line feed.
+   procedure Test_Substitute_Reads_Like_The_Lexer is
+      Seven : constant Bind_Array := [To_Cell (Long_Long_Integer'(7))];
+   begin
+      Check_Equal (Sql.Substitute ("SELECT 1 AS a$$b, ?", Seven),
+                   "SELECT 1 AS a$$b, 7", "the $$ inside a name");
+      Check_Equal (Sql.Substitute ("SELECT 1 -- c" & CR & ", ?", Seven),
+                   "SELECT 1 -- c" & CR & ", 7",
+                   "-- comment ended by a carriage return");
+      Check_Equal (Sql.Substitute ("SELECT 1 // c" & CR & ", ?", Seven),
+                   "SELECT 1 // c" & CR & ", 7",
+                   "// comment ended by a carriage return");
+      Check_Equal
+        (Sql.Substitute ("SELECT 1 -- c" & CR & LF & ", ?", Seven),
+         "SELECT 1 -- c" & CR & LF & ", 7",
+         "comment ended by a carriage return and line feed");
+   end Test_Substitute_Reads_Like_The_Lexer;
+
    procedure Test_Selects_Session_State is
    begin
       Check (Sql.Selects_Session_State ("USE DATABASE X"), "plain USE");
@@ -229,6 +283,8 @@ procedure Frostlake_Tests is
              "USE after a semicolon");
       Check (Sql.Selects_Session_State ("SELECT 1" & LF & "USE WAREHOUSE W"),
              "USE after a newline");
+      Check (Sql.Selects_Session_State ("-- note" & CR & "USE ROLE R"),
+             "USE after a comment a carriage return ends");
       Check (not Sql.Selects_Session_State ("SELECT 'USE THIS'"),
              "USE inside a line is not a USE statement");
       Check (not Sql.Selects_Session_State ("USELESS"),
@@ -264,8 +320,11 @@ procedure Frostlake_Tests is
       Touches ("CREATE OR REPLACE LOCAL TEMPORARY TABLE t (a INT)");
       Touches ("CREATE VOLATILE TABLE t (a INT)");
       Touches ("/* note */ -- more" & LF & " USE WAREHOUSE w");
+      Touches ("-- note" & CR & "USE WAREHOUSE w");
       --  A USE riding behind another statement still counts.
       Touches ("SELECT 1; USE SCHEMA other");
+      --  Even behind a name holding $$, which opens no body.
+      Touches ("SELECT 1 AS a$$b; USE SCHEMA other");
 
       Leaves ("SELECT 1");
       Leaves ("CREATE TABLE t (a INT)");
@@ -306,6 +365,8 @@ procedure Frostlake_Tests is
       --  A request is what its last such statement leaves it as.
       Expect ("BEGIN; INSERT INTO t VALUES (1); COMMIT", Sql.Closes);
       Expect ("BEGIN; INSERT INTO t VALUES (1)", Sql.Opens);
+      Expect ("-- note" & CR & "BEGIN", Sql.Opens);
+      Expect ("SELECT 1 AS a$$b; BEGIN", Sql.Opens);
    end Test_Transaction_Effect;
 
    ---------------------------------------------------------------
@@ -1827,6 +1888,10 @@ begin
    Guarded ("quote identifier", Test_Quote_Identifier'Access);
    Guarded ("format literal", Test_Format_Literal'Access);
    Guarded ("substitute", Test_Substitute'Access);
+   Guarded ("substitute negative numbers",
+            Test_Substitute_Negative_Numbers'Access);
+   Guarded ("substitute reads like the lexer",
+            Test_Substitute_Reads_Like_The_Lexer'Access);
    Guarded ("selects session state", Test_Selects_Session_State'Access);
    Guarded ("touches session", Test_Touches_Session'Access);
    Guarded ("transaction effect", Test_Transaction_Effect'Access);

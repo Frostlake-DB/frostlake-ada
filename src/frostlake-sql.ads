@@ -17,13 +17,18 @@ package Frostlake.Sql is
    --  The SQL literal for one bind value.  Timestamps carrying an offset
    --  become '...'::TIMESTAMP_TZ, offset-less ones '...'::TIMESTAMP_NTZ;
    --  dates '...'::DATE; binary X'HEX'; variants PARSE_JSON('...').  A
-   --  non-finite Float raises Usage_Error.
+   --  negative number is written in parentheses, (-5), so it stays one
+   --  value after a minus or before a cast.  A non-finite Float raises
+   --  Usage_Error.
 
    function Substitute (Sql : String; Binds : Bind_Array) return String;
    --  Replaces each ? outside of '...' and "..." literals, -- and //
    --  line comments, /* */ block comments and $$...$$ bodies with the
-   --  next bind's literal.  Raises Usage_Error when placeholders outrun
-   --  the binds; unused binds are not an error.
+   --  next bind's literal.  The text is read as the engine's lexer reads
+   --  it: a line comment ends at a line feed or a carriage return, and a
+   --  name is read whole, so the $$ in a$$b opens no body.  Raises
+   --  Usage_Error when placeholders outrun the binds; unused binds are not
+   --  an error.
 
    function Selects_Session_State (Sql : String) return Boolean;
    --  Whether the statement is a USE — the caller picking their own

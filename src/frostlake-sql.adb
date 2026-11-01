@@ -47,6 +47,19 @@ package body Frostlake.Sql is
       return C;
    end Upper;
 
+   --  A name as the lexer reads an IDENTIFIER, [a-zA-Z_][a-zA-Z0-9_$]*,
+   --  always whole: the $$ inside a$$b opens no dollar-quoted body.
+   function Is_Name_Start (C : Character) return Boolean is
+     (C in 'a' .. 'z' | 'A' .. 'Z' | '_');
+
+   function Is_Name_Part (C : Character) return Boolean is
+     (C in 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' | '$');
+
+   --  A line comment ends at a line feed or a carriage return, whichever
+   --  comes first, as the lexer's LINE_COMMENT does: ('--' | '//') ~[\r\n]*.
+   function Is_Line_End (C : Character) return Boolean is
+     (C = Character'Val (10) or else C = Character'Val (13));
+
    --  A plain SQL numeric literal: the only digit text safe to inline
    --  verbatim.  Anything else in a Decimal cell would splice raw text
    --  into the statement.
@@ -158,6 +171,14 @@ package body Frostlake.Sql is
       return Sign & Padded (Total / 60, 2) & ':' & Padded (Total mod 60, 2);
    end Offset_Image;
 
+   --  A negative number goes in parentheses, which is one value wherever
+   --  it lands: bare, 3-? bound to -5 would read 3--5, a line comment, and
+   --  ?::VARCHAR would cast before it negates.  Judged on the rendered
+   --  text, so a negative zero float is wrapped too.
+   function Number_Literal (Text : String) return String is
+     (if Text'Length > 0 and then Text (Text'First) = '-'
+      then '(' & Text & ')' else Text);
+
    function Format_Literal (Value : Cell) return String is
    begin
       case Value.Kind is
@@ -168,7 +189,8 @@ package body Frostlake.Sql is
             return (if Value.Bool then "TRUE" else "FALSE");
 
          when Integer_Kind =>
-            return Trimmed (Long_Long_Integer'Image (Value.Int));
+            return Number_Literal
+              (Trimmed (Long_Long_Integer'Image (Value.Int)));
 
          when Decimal_Kind =>
             declare
@@ -178,7 +200,7 @@ package body Frostlake.Sql is
                   raise Usage_Error with
                     "decimal bind is not a numeric literal: " & Text;
                end if;
-               return Text;
+               return Number_Literal (Text);
             end;
 
          when Float_Kind =>
@@ -188,7 +210,7 @@ package body Frostlake.Sql is
             then
                raise Usage_Error with "non-finite number cannot be bound";
             end if;
-            return Trimmed (Long_Float'Image (Value.Real));
+            return Number_Literal (Trimmed (Long_Float'Image (Value.Real)));
 
          when Text_Kind =>
             return Encoded_Text (To_String (Value.Text));
@@ -280,16 +302,27 @@ package body Frostlake.Sql is
          return Sql'Last;
       end Quoted_End;
 
-      --  Through the end of the line, newline included.
+      --  Through the end of the line, its line feed or carriage return
+      --  included.
       function Line_End return Natural is
       begin
          for J in I .. Sql'Last loop
-            if Sql (J) = Character'Val (10) then
+            if Is_Line_End (Sql (J)) then
                return J;
             end if;
          end loop;
          return Sql'Last;
       end Line_End;
+
+      --  Through the last character of the name opening at I.
+      function Name_End return Natural is
+         J : Natural := I;
+      begin
+         while J < Sql'Last and then Is_Name_Part (Sql (J + 1)) loop
+            J := J + 1;
+         end loop;
+         return J;
+      end Name_End;
 
       --  Past a closing Mark (*/ or $$); to the end when unterminated.
       function Pair_End (Mark : String) return Natural is
@@ -320,6 +353,10 @@ package body Frostlake.Sql is
            and then Sql (I + 1) = '/'
          then
             Copy_Through (Line_End);
+         elsif Is_Name_Start (Sql (I)) then
+            --  A name is read whole, as the lexer reads one: the $$ in
+            --  a$$b opens no dollar-quoted body.
+            Copy_Through (Name_End);
          elsif Sql (I) = '$' and then I < Sql'Last
            and then Sql (I + 1) = '$'
          then
@@ -366,7 +403,7 @@ package body Frostlake.Sql is
          return True;
       end if;
       for I in Sql'First .. Sql'Last loop
-         if (Sql (I) = ';' or else Sql (I) = Character'Val (10))
+         if (Sql (I) = ';' or else Is_Line_End (Sql (I)))
            and then Use_At (I + 1)
          then
             return True;
@@ -379,9 +416,9 @@ package body Frostlake.Sql is
    --  Touches_Session, Transaction_Effect --
    ------------------------------------------
 
-   --  Just past the literal, quoted identifier, $$ body or comment opening
-   --  at I, or 0 when I is code: the rules Substitute follows, so binding and
-   --  session tracking cannot disagree about what is code.
+   --  Just past the name, literal, quoted identifier, $$ body or comment
+   --  opening at I, or 0 when I is other code: the rules Substitute follows,
+   --  so binding and session tracking cannot disagree about what is code.
    function Skip_Non_Code (Sql : String; I : Positive) return Natural is
       Next : constant Character :=
         (if I < Sql'Last then Sql (I + 1) else Character'Val (0));
@@ -390,7 +427,7 @@ package body Frostlake.Sql is
       function Line_End return Natural is
       begin
          for K in I .. Sql'Last loop
-            if Sql (K) = Character'Val (10) then
+            if Is_Line_End (Sql (K)) then
                return K + 1;
             end if;
          end loop;
@@ -409,6 +446,14 @@ package body Frostlake.Sql is
 
    begin
       case Sql (I) is
+         when 'a' .. 'z' | 'A' .. 'Z' | '_' =>
+            --  A name holds no separator, and the $$ inside one opens no
+            --  body.
+            J := I + 1;
+            while J <= Sql'Last and then Is_Name_Part (Sql (J)) loop
+               J := J + 1;
+            end loop;
+            return J;
          when ''' =>
             --  A backslash always escapes; '' is a doubled quote.
             J := I + 1;
